@@ -6,7 +6,7 @@ set -Eeuo pipefail
 DEFAULT_SSH_PUBLIC_KEYS=(
     # "ssh-ed25519 AAAA... user@example"
 )
-VERSION="1.0.2"
+VERSION="1.1.0"
 BASIC_PACKAGES=(sudo curl ca-certificates git vim htop unzip)
 SSHD_CONFIG="/etc/ssh/sshd_config"
 SSH_DROPIN_DIR="/etc/ssh/sshd_config.d"
@@ -22,6 +22,15 @@ SSH_PREVIOUS_EXISTS=0
 SSH_RELOAD_ATTEMPTED=0
 SSH_ROLLBACK_FAILED=0
 SSH_SERVICE=""
+SSH_SOCKET=""
+SSH_RUNTIME_DIR="/run/sshd"
+SSH_MIGRATION_NEEDED=0
+SSH_MODE_CHANGED=0
+SSH_RUNTIME_STATE=""
+SSH_ORIGINAL_SERVICE_ACTIVE=""
+SSH_ORIGINAL_SERVICE_ENABLED=""
+SSH_ORIGINAL_SOCKET_ACTIVE=""
+SSH_ORIGINAL_SOCKET_ENABLED=""
 SSHD=""
 OS_NAME="unknown"
 UID_MIN=1000
@@ -46,6 +55,7 @@ write_elevated_script() {
         printf '#!/usr/bin/env bash\nset -Eeuo pipefail\n'
         declare -p DEFAULT_SSH_PUBLIC_KEYS VERSION BASIC_PACKAGES SSHD_CONFIG SSH_DROPIN_DIR SSH_DROPIN SSH_ENV_FILES BACKUP_ROOT SSH_CONTEXT
         declare -p WORK_DIR SSH_BACKUP SSH_CANDIDATE SSH_TRANSACTION SSH_PREVIOUS_EXISTS SSH_RELOAD_ATTEMPTED SSH_ROLLBACK_FAILED SSH_SERVICE SSHD OS_NAME UID_MIN UID_MAX COLOR RESET
+        declare -p SSH_SOCKET SSH_RUNTIME_DIR SSH_MIGRATION_NEEDED SSH_MODE_CHANGED SSH_RUNTIME_STATE SSH_ORIGINAL_SERVICE_ACTIVE SSH_ORIGINAL_SERVICE_ENABLED SSH_ORIGINAL_SOCKET_ACTIVE SSH_ORIGINAL_SOCKET_ENABLED
         declare -f
         printf '\nmain "$@"\n'
     } > "$1"
@@ -315,9 +325,15 @@ get_effective_sshd_config() {
 }
 config_value() { printf '%s\n' "$1" | awk -v key="$2" '$1 == key {$1=""; sub(/^ /, ""); print; exit}'; }
 show_ssh_values() {
-    local config=$1 key
+    local config=$1 key label
     for key in pubkeyauthentication passwordauthentication kbdinteractiveauthentication permitrootlogin; do
-        say "$key: $(config_value "$config" "$key")"
+        case "$key" in
+            pubkeyauthentication) label=PubkeyAuthentication ;;
+            passwordauthentication) label=PasswordAuthentication ;;
+            kbdinteractiveauthentication) label=KbdInteractiveAuthentication ;;
+            permitrootlogin) label=PermitRootLogin ;;
+        esac
+        say "$label: $(config_value "$config" "$key")"
     done
 }
 key_only_values() {
@@ -370,66 +386,137 @@ check_supported_ssh_layout() {
         *) warn '存在额外公钥认证要求，需人工检查。'; return 1 ;;
     esac
 }
-check_ssh_reload_mode() {
-    local triggers sockets unit status state enabled related=()
-    triggers=$(systemctl show "$SSH_SERVICE" -p TriggeredBy --value) || return 1
-    sockets=$(systemctl show "$SSH_SERVICE" -p Sockets --value) || return 1
-    if [[ -n $sockets ]]; then
-        warn "SSH 服务显式继承 socket（Sockets: ${sockets}），拒绝修改。"; return 1
-    fi
-    if [[ -n $triggers ]]; then
-        read -r -a related <<< "$triggers"
-        for unit in "${related[@]}"; do
-            [[ $unit == *.socket ]] || continue
-            state=$(systemctl show "$unit" -p ActiveState --value) || return 1
-            enabled=$(systemctl show "$unit" -p UnitFileState --value) || return 1
-            case "$state:$enabled" in
-                inactive:disabled|inactive:masked|failed:disabled|failed:masked) ;;
-                *)
-                    warn "SSH 关联 ${unit}（状态: ${state:-unknown}, 开机状态: ${enabled:-unknown}）。"
-                    warn 'socket activation 下部分 OpenSSH 版本 reload 会失败，拒绝修改 SSH 配置。'
-                    warn '请先人工检查 SSH 启动方式；工具不会停止 socket 或自动切换服务模式。'
-                    return 1 ;;
-            esac
-        done
-    fi
-    for unit in ssh.socket sshd.socket; do
-        if systemctl is-active --quiet "$unit"; then
-            warn "$unit 正在运行，无法确认 SSH reload 安全；拒绝修改。"; return 1
-        else
-            status=$?
-            case "$status" in
-                3|4) ;; # inactive or no such unit
-                *) warn "无法确认 $unit 状态，拒绝修改。"; return 1 ;;
-            esac
-        fi
-    done
-    check_sshd_listener_ownership
+# Read explicit is-active/is-enabled results: their nonzero inactive/disabled
+# exit codes are expected, but transitional or unrecognized states are not.
+ssh_active_state() {
+    local state
+    state=$(systemctl is-active "$1" 2>/dev/null) || true
+    case "$state" in active|inactive|failed|unknown) printf '%s\n' "$state" ;; *) return 1 ;; esac
+}
+ssh_enabled_state() {
+    local state
+    state=$(systemctl is-enabled "$1" 2>/dev/null) || true
+    case "$state" in enabled|enabled-runtime|disabled|masked|masked-runtime|static|alias|not-found) printf '%s\n' "$state" ;; *) return 1 ;; esac
+}
+ssh_port22_listeners() {
+    local listeners
+    command -v ss >/dev/null || { warn '需要 ss（iproute2）核对 22 端口。'; return 1; }
+    listeners=$(ss -H -lntp) || { warn '无法查询 TCP 监听进程。'; return 1; }
+    awk '$1=="LISTEN" && $4 ~ /:22$/ {print}' <<< "$listeners"
 }
 check_sshd_listener_ownership() {
     local pid listeners line found=0
-    command -v ss >/dev/null || { warn '需要 ss（iproute2）核对 SSH 监听进程，拒绝修改。'; return 1; }
     pid=$(systemctl show "$SSH_SERVICE" -p MainPID --value) || return 1
-    [[ $pid =~ ^[1-9][0-9]{0,9}$ ]] || { warn '无法确认 SSH 主进程 PID，拒绝修改。'; return 1; }
-    listeners=$(ss -H -lntp) || { warn '无法查询 TCP 监听进程，拒绝修改。'; return 1; }
+    [[ $pid =~ ^[1-9][0-9]{0,9}$ ]] || { warn '无法确认 SSH 主进程 PID。'; return 1; }
+    listeners=$(ssh_port22_listeners) || return 1
     while IFS= read -r line; do
-        [[ $line == *"pid=$pid,"* ]] || continue
-        if [[ $line == *'pid=1,'* ]]; then
-            warn 'SSH 监听 socket 仍由 systemd 共同持有，拒绝 reload。'; return 1
-        fi
+        [[ -n $line ]] || continue
+        [[ $line == *"pid=$pid,"* && $line == *'("sshd",'* && $line != *'pid=1,'* ]] || {
+            warn '22 端口未由 SSH 主进程独立监听（可能仍由 socket / 其他进程持有）。'; return 1;
+        }
         found=1
     done <<< "$listeners"
-    (( found )) || { warn 'SSH 主进程没有可确认的 TCP 监听 socket，拒绝修改。'; return 1; }
+    (( found )) || { warn '22 端口没有可确认的 sshd LISTEN。'; return 1; }
+}
+check_ssh_stop_policy() {
+    local property value argv
+    [[ $(systemctl show "$SSH_SERVICE" -p KillMode --value) == process ]] || {
+        warn 'SSH KillMode 不是 process，停止服务可能断开当前会话；拒绝迁移。'; return 1;
+    }
+    [[ $(systemctl show "$SSH_SERVICE" -p SendSIGHUP --value) == no ]] || { warn 'SSH SendSIGHUP 不是 no，停止可能向已有会话发送 HUP。'; return 1; }
+    value=$(systemctl show "$SSH_SERVICE" -p KillSignal --value) || return 1
+    case "$value" in 15|SIGTERM) ;; *) warn 'SSH 停止信号不是 SIGTERM，拒绝迁移。'; return 1 ;; esac
+    for property in ExecStop ExecStopPost; do
+        value=$(systemctl show "$SSH_SERVICE" -p "$property" --value) || return 1
+        [[ -z $value ]] || { warn "SSH 存在自定义 ${property}，不能保证保留会话。"; return 1; }
+    done
+    value=$(systemctl show "$SSH_SERVICE" -p ExecStartPre --value) || return 1
+    argv=${value#*argv[]=}; argv=${argv%% ;*}
+    case "$argv" in ''|'/usr/sbin/sshd -t') ;; *) warn 'SSH 存在非标准 ExecStartPre，拒绝自动启动。'; return 1 ;; esac
+    [[ -z $(systemctl show "$SSH_SERVICE" -p ExecStartPost --value) ]] || { warn 'SSH 存在自定义 ExecStartPost，拒绝自动启动。'; return 1; }
+}
+check_ssh_reload_mode() {
+    local triggers sockets unit property dependencies service_active service_enabled socket_active=unknown socket_enabled=not-found config listen mapping line
+    SSH_MIGRATION_NEEDED=0
+    SSH_SOCKET=''
+    triggers=$(systemctl show "$SSH_SERVICE" -p TriggeredBy --value) || return 1
+    sockets=$(systemctl show "$SSH_SERVICE" -p Sockets --value) || return 1
+    [[ -z $sockets ]] || { warn "SSH 服务有显式 Sockets=${sockets}，需人工审查。"; return 1; }
+    for unit in $triggers; do
+        case "$unit" in ssh.socket|sshd.socket) ;; *) warn "未知 SSH 触发单元: $unit"; return 1 ;; esac
+    done
+    # ssh.socket and sshd.socket may be aliases: retain the canonical unit ID.
+    for unit in ssh.socket sshd.socket; do
+        [[ $(systemctl show "$unit" -p LoadState --value) == loaded ]] || continue
+        mapping=$(systemctl show "$unit" -p Id --value) || return 1
+        [[ $mapping == ssh.socket || $mapping == sshd.socket ]] || return 1
+        [[ -z $SSH_SOCKET || $SSH_SOCKET == "$mapping" ]] || { warn '检测到多个 SSH socket，需人工审查。'; return 1; }
+        SSH_SOCKET=$mapping
+    done
+    service_active=$(ssh_active_state "$SSH_SERVICE") || return 1
+    service_enabled=$(ssh_enabled_state "$SSH_SERVICE") || return 1
+    if [[ -n $SSH_SOCKET ]]; then
+        socket_active=$(ssh_active_state "$SSH_SOCKET") || { warn 'SSH socket 状态不稳定。'; return 1; }
+        socket_enabled=$(ssh_enabled_state "$SSH_SOCKET") || return 1
+        case "$socket_enabled" in enabled|enabled-runtime) SSH_MIGRATION_NEEDED=1 ;; esac
+        [[ $socket_active != active ]] || SSH_MIGRATION_NEEDED=1
+    fi
+    SSH_RUNTIME_STATE="$SSH_SERVICE:$service_active:$service_enabled:$SSH_SOCKET:$socket_active:$socket_enabled"
+    if (( SSH_MIGRATION_NEEDED )); then
+        check_ssh_stop_policy || return 1
+        case "$service_enabled" in enabled|enabled-runtime|disabled) ;; *) warn 'SSH 服务开机状态不能安全恢复，拒绝迁移。'; return 1 ;; esac
+        case "$socket_enabled" in enabled|enabled-runtime|disabled) ;; *) warn 'SSH socket 开机状态不能安全恢复，拒绝迁移。'; return 1 ;; esac
+        # Starting a service with explicit socket dependencies could reactivate it.
+        for property in Requires Wants BindsTo; do
+            dependencies=$(systemctl show "$SSH_SERVICE" -p "$property" --value) || return 1
+            [[ $dependencies != *'.socket'* ]] || { warn "SSH $property 包含 socket 依赖，拒绝迁移。"; return 1; }
+        done
+        [[ $(systemctl show "$SSH_SOCKET" -p Accept --value) == no ]] || { warn '仅支持 Accept=no 的标准 SSH socket。'; return 1; }
+        mapping=$(systemctl show "$SSH_SOCKET" -p Triggers --value) || return 1
+        [[ $mapping == "$SSH_SERVICE" ]] || { warn 'SSH socket 的 Service 映射非标准，拒绝迁移。'; return 1; }
+        for property in ExecStartPre ExecStartPost ExecStopPre ExecStopPost; do
+            [[ -z $(systemctl show "$SSH_SOCKET" -p "$property" --value) ]] || { warn "SSH socket 存在 $property 钩子，拒绝迁移。"; return 1; }
+        done
+        listen=$(systemctl show "$SSH_SOCKET" -p Listen --value) || return 1
+        case "$listen" in '[::]:22 (Stream)'|'0.0.0.0:22 (Stream)'|'[::]:22 (Stream) 0.0.0.0:22 (Stream)'|'0.0.0.0:22 (Stream) [::]:22 (Stream)') ;;
+            *) warn "SSH socket 不是标准 22 端口全地址监听: $listen"; return 1 ;;
+        esac
+        config=$(get_effective_sshd_config) || return 1
+        [[ $(awk '$1=="port" {print $2}' <<< "$config") == 22 && $(config_value "$config" addressfamily) == any ]] || {
+            warn 'sshd 端口 / 地址族与标准 socket 不匹配，拒绝迁移。'; return 1;
+        }
+        listen=$(awk '$1=="listenaddress" {print $2}' <<< "$config")
+        [[ $listen == $'[::]:22\n0.0.0.0:22' || $listen == $'0.0.0.0:22\n[::]:22' ]] || {
+            warn 'sshd ListenAddress 非标准全地址监听，拒绝迁移。'; return 1;
+        }
+        [[ $service_active == active || $socket_active == active ]] || { warn 'SSH 服务和 socket 均未运行。'; return 1; }
+        if [[ $socket_active == active ]]; then
+            listen=$(ssh_port22_listeners) || return 1
+            [[ -n $listen ]] || { warn '迁移前 22 端口没有 LISTEN。'; return 1; }
+            while IFS= read -r line; do
+                [[ $line == *'pid=1,'* ]] || { warn '活动 SSH socket 没有持有 22 端口，拒绝迁移。'; return 1; }
+            done <<< "$listen"
+        else
+            check_sshd_listener_ownership || return 1
+        fi
+    else
+        [[ $service_active == active ]] || { warn 'SSH 服务未运行。'; return 1; }
+        [[ $(systemctl show "$SSH_SERVICE" -p CanReload --value) == yes ]] || { warn 'SSH 服务不支持 reload。'; return 1; }
+        check_sshd_listener_ownership || return 1
+    fi
 }
 find_ssh_service() {
     local service start argv environment file token allowed environment_files tokens=()
     command -v systemctl >/dev/null || { warn '无 systemd，SSH 加固仅支持可确认的 systemd reload。'; return 1; }
     SSH_SERVICE=''
     for service in ssh.service sshd.service; do
-        if systemctl is-active --quiet "$service"; then SSH_SERVICE=$service; break; fi
+        if [[ $(systemctl show "$service" -p LoadState --value) == loaded ]]; then
+            SSH_SERVICE=$(systemctl show "$service" -p Id --value) || return 1
+            break
+        fi
     done
-    [[ -n $SSH_SERVICE ]] || { warn '没有正在运行的 ssh.service / sshd.service。'; return 1; }
-    check_ssh_reload_mode || return 1
+    [[ -n $SSH_SERVICE ]] || { warn '没有已加载的 ssh.service / sshd.service。'; return 1; }
+    case "$SSH_SERVICE" in ssh.service|sshd.service) ;; *) warn 'SSH 服务 Id 非标准。'; return 1 ;; esac
     start=$(systemctl show "$SSH_SERVICE" -p ExecStart --value) || return 1
     argv=${start#*argv[]=}; argv=${argv%% ;*}
     # systemd expands this literal variable at service start; do not expand it here.
@@ -459,20 +546,127 @@ find_ssh_service() {
             warn "SSH 环境文件不是空 SSHD_OPTS 配置，需人工审查: $file"; return 1
         fi
     done
-    [[ $(systemctl show "$SSH_SERVICE" -p CanReload --value) == yes ]] || { warn 'SSH 服务不支持 reload。'; return 1; }
+    check_ssh_reload_mode
 }
 report_ssh_conflicts() {
     warn '可能冲突的文件/指令（未 reload）：'
     grep -nEi '^[[:space:]]*(Include|Match|PubkeyAuthentication|PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|PermitRootLogin)' "$SSHD_CONFIG" "$SSH_DROPIN_DIR"/*.conf >&2 || true
 }
+ssh_service_step() {
+    local label=$1
+    shift
+    "$@" || { warn "SSH 服务操作失败: ${label}；这是服务/监听应用失败，不代表 sshd_config 语法错误。"; return 1; }
+}
 check_ssh_service_health() {
-    local _attempt
-    # ExecReload can finish before sshd completes its SIGHUP re-exec.
+    local _attempt state
+    # ExecReload/start can return before a subsequent daemon failure.
     for _attempt in 1 2 3; do
         sleep 1
-        systemctl is-active --quiet "$SSH_SERVICE" || return 1
+        systemctl is-active --quiet "$SSH_SERVICE" || { warn "$SSH_SERVICE 未保持 active。"; return 1; }
+        if (( SSH_MODE_CHANGED )); then
+            [[ $(ssh_enabled_state "$SSH_SERVICE") == enabled ]] || { warn 'SSH 服务未永久启用。'; return 1; }
+        fi
+        if [[ -n $SSH_SOCKET ]]; then
+            state=$(ssh_active_state "$SSH_SOCKET") || return 1
+            [[ $state == inactive || $state == failed ]] || { warn 'SSH socket 仍在运行。'; return 1; }
+            state=$(ssh_enabled_state "$SSH_SOCKET") || return 1
+            case "$state" in disabled|masked|masked-runtime) ;; *) warn 'SSH socket 仍启用。'; return 1 ;; esac
+        fi
         check_sshd_listener_ownership || return 1
     done
+}
+apply_ssh_configuration() {
+    # The candidate has already passed -t/-T/-C. Never HUP a socket listener.
+    SSH_RELOAD_ATTEMPTED=1
+    if (( SSH_MIGRATION_NEEDED )); then
+        SSH_MODE_CHANGED=1 # Set BEFORE the first potentially partial mutation.
+        ssh_service_step "停止 $SSH_SOCKET" systemctl stop "$SSH_SOCKET" || return 1
+        ssh_service_step "禁用 $SSH_SOCKET" systemctl disable "$SSH_SOCKET" || return 1
+        if [[ $SSH_ORIGINAL_SOCKET_ENABLED == enabled-runtime ]]; then
+            ssh_service_step "禁用临时 $SSH_SOCKET" systemctl disable --runtime "$SSH_SOCKET" || return 1
+        fi
+        # start on an already active service is a no-op. With KillMode=process,
+        # stopping only the listener preserves established sshd session children.
+        ssh_service_step "停止 $SSH_SERVICE 监听主进程" systemctl stop "$SSH_SERVICE" || return 1
+        ssh_service_step "清除 $SSH_SERVICE 失败状态" systemctl reset-failed "$SSH_SERVICE" || return 1
+        ssh_service_step "启用 $SSH_SERVICE" systemctl enable "$SSH_SERVICE" || return 1
+        ssh_service_step "启动 $SSH_SERVICE" systemctl start "$SSH_SERVICE" || return 1
+    else
+        ssh_service_step "reload $SSH_SERVICE" systemctl reload "$SSH_SERVICE" || return 1
+    fi
+    check_ssh_service_health
+}
+restore_ssh_enabled_state() {
+    local unit=$1 state=$2
+    systemctl disable "$unit" || return 1
+    systemctl disable --runtime "$unit" || return 1
+    case "$state" in
+        enabled) systemctl enable "$unit" ;;
+        enabled-runtime) systemctl enable --runtime "$unit" ;;
+        disabled) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+prepare_ssh_runtime_dir() {
+    # A failed/stopped unit can have removed RuntimeDirectory before rollback -t.
+    # This is recovery only: the original -t gate is NEVER bypassed.
+    [[ ! -L $SSH_RUNTIME_DIR ]] || return 1
+    [[ -d $SSH_RUNTIME_DIR ]] || install -d -o root -g root -m 0755 "$SSH_RUNTIME_DIR"
+}
+restore_ssh_runtime() {
+    local failed=0 listeners _attempt unit state
+    if (( SSH_MODE_CHANGED )); then
+        # Revalidate the stop policy rather than risking killing session children.
+        check_ssh_stop_policy || return 1
+        systemctl stop "$SSH_SOCKET" || return 1
+        systemctl stop "$SSH_SERVICE" || return 1
+        prepare_ssh_runtime_dir && "$SSHD" -t -f "$SSHD_CONFIG" || return 1
+        restore_ssh_enabled_state "$SSH_SOCKET" "$SSH_ORIGINAL_SOCKET_ENABLED" || failed=1
+        restore_ssh_enabled_state "$SSH_SERVICE" "$SSH_ORIGINAL_SERVICE_ENABLED" || failed=1
+        systemctl reset-failed "$SSH_SERVICE" || failed=1
+        if [[ $SSH_ORIGINAL_SOCKET_ACTIVE == active ]]; then
+            systemctl start "$SSH_SOCKET" || failed=1
+        fi
+        if [[ $SSH_ORIGINAL_SERVICE_ACTIVE == active ]]; then
+            systemctl start "$SSH_SERVICE" || failed=1
+        fi
+        [[ $(ssh_enabled_state "$SSH_SOCKET") == "$SSH_ORIGINAL_SOCKET_ENABLED" ]] || failed=1
+        [[ $(ssh_enabled_state "$SSH_SERVICE") == "$SSH_ORIGINAL_SERVICE_ENABLED" ]] || failed=1
+        for _attempt in 1 2 3; do
+            sleep 1
+            if [[ $SSH_ORIGINAL_SERVICE_ACTIVE == active ]]; then
+                systemctl is-active --quiet "$SSH_SERVICE" || failed=1
+            fi
+            if [[ $SSH_ORIGINAL_SOCKET_ACTIVE == active ]]; then
+                systemctl is-active --quiet "$SSH_SOCKET" || failed=1
+                listeners=$(ssh_port22_listeners) || return 1
+                [[ -n $listeners && $listeners == *'pid=1,'* ]] || failed=1
+            else
+                [[ $(ssh_active_state "$SSH_SOCKET") != active ]] || failed=1
+                check_sshd_listener_ownership || failed=1
+            fi
+        done
+        (( failed == 0 ))
+    else
+        # If SIGHUP made the listener exit, reload cannot recover it. A fresh
+        # start recreates systemd RuntimeDirectory and preserves session children.
+        prepare_ssh_runtime_dir && "$SSHD" -t -f "$SSHD_CONFIG" || return 1
+        # A socket may have been enabled by another operator while applying.
+        # Recovery must not repeat the very socket/SIGHUP failure we avoid.
+        for unit in ssh.socket sshd.socket; do
+            [[ $(systemctl show "$unit" -p LoadState --value) == loaded ]] || continue
+            state=$(ssh_active_state "$unit") || return 1
+            [[ $state == inactive || $state == failed ]] || { warn '恢复时发现 SSH socket 已启动，拒绝发送 HUP。'; return 1; }
+        done
+        if systemctl is-active --quiet "$SSH_SERVICE"; then
+            check_sshd_listener_ownership || return 1
+            systemctl reload "$SSH_SERVICE" || return 1
+        else
+            check_ssh_stop_policy || return 1
+            systemctl reset-failed "$SSH_SERVICE" && systemctl start "$SSH_SERVICE" || return 1
+        fi
+        check_ssh_service_health
+    fi
 }
 rollback_ssh() {
     # Failure is terminal for this transaction. main/EXIT must not retry it.
@@ -492,17 +686,16 @@ rollback_ssh() {
     SSH_TRANSACTION=0
     warn '已恢复 SSH drop-in。'
     if (( SSH_RELOAD_ATTEMPTED )); then
-        if ! systemctl is-active --quiet "$SSH_SERVICE"; then
-            warn "原配置已恢复，但 $SSH_SERVICE 已停止/失败；reload 无法启动已退出的服务。"
-            warn "请保留当前会话，用 Console 或当前 root 会话人工恢复服务。备份: $SSH_BACKUP"
+        if restore_ssh_runtime; then
+            warn '已恢复原 SSH 启动模式和 22 端口监听；请另开终端验证登录。'
+        else
+            warn "配置已恢复，但 SSH 服务/监听恢复验证失败！不要关闭当前会话；请用 Console 或当前 root 会话排查。备份: $SSH_BACKUP"
+            warn '请检查 systemctl status ssh.service ssh.socket、journalctl -u ssh.service 和 ss -lntp。'
+            show_ssh_runtime_status >&2
             return 1
         fi
-        if "$SSHD" -t -f "$SSHD_CONFIG" && systemctl reload "$SSH_SERVICE" && check_ssh_service_health; then
-            warn '已 reload 恢复后的 SSH 配置。'
-        else
-            warn "恢复配置已写回，但服务恢复验证失败！保留当前会话，使用备份 $SSH_BACKUP 排查。"; return 1
-        fi
     fi
+    SSH_MODE_CHANGED=0
     SSH_ROLLBACK_FAILED=0
 }
 cleanup() {
@@ -535,15 +728,19 @@ verify_key_only() {
     done
 }
 disable_ssh_password_auth() {
-    local config user
+    local config user planned_state
+    # Syntax is the first gate, before account checks, backups or unit changes.
+    if [[ -z $SSHD ]] || ! "$SSHD" -t -f "$SSHD_CONFIG"; then
+        warn '原始 SSH 配置验证失败，未修改配置或服务。'; return 1
+    fi
     config=$(get_effective_sshd_config) || return 0
     if [[ $(config_value "$config" passwordauthentication) == no ]]; then
         say 'SSH password authentication is already disabled.'
         show_ssh_values "$config"
-        if key_only_values "$config" 2>/dev/null; then
-            say '四项全局设置均已满足；未重复修改（Match / 服务运行状态仍需核对）。'; return 0
+        if key_only_values "$config" 2>/dev/null && find_ssh_service && (( ! SSH_MIGRATION_NEEDED )); then
+            say '四项设置及服务监听均已满足；未重复修改。'; return 0
         fi
-        warn '其余目标项尚未全部满足，将按完整前置检查处理。'
+        warn '认证目标或 SSH 启动模式仍需处理，将按完整前置检查执行。'
     fi
     if ! check_ssh_hardening_readiness; then
         warn 'Cannot disable SSH password authentication.'
@@ -551,21 +748,37 @@ disable_ssh_password_auth() {
         say '请先创建用户、设置 Linux 密码、授予 sudo 并授权 SSH Key。'; return 0
     fi
     check_supported_ssh_layout && find_ssh_service || return 0
-    "$SSHD" -t -f "$SSHD_CONFIG" || { warn '原始 SSH 配置验证失败，未修改。'; return 0; }
+    planned_state=$SSH_RUNTIME_STATE
     say '以下普通管理员已配置公钥：'
     for user in "${READY_USERS[@]}"; do say "- $user (sudo: yes, keys: $(count_authorized_keys "$user"))"; done
     say '此操作禁止 root SSH、SSH 密码和键盘交互认证，保留 Linux 本地密码。'
+    if (( SSH_MIGRATION_NEEDED )); then
+        say "检测到 SSH socket 已启用/运行，将停止并禁用 ${SSH_SOCKET}，切换到 ${SSH_SERVICE}（仅停止监听主进程，保留已有会话）。"
+    else
+        say "当前为传统服务模式，将校验后 reload ${SSH_SERVICE}。"
+    fi
     say '请先在新终端实际验证普通用户公钥登录和 sudo，再返回此处确认。'
     confirm '已完成新终端验证，继续关闭 SSH 密码登录？ [y/N] ' n || return 0
     # Recheck account state immediately before the transaction.
     check_ssh_hardening_readiness || { warn '前置状态发生变化，取消。'; return 0; }
     # The operator may have changed service state during new-terminal verification.
     find_ssh_service || return 0
+    [[ $SSH_RUNTIME_STATE == "$planned_state" ]] || { warn 'SSH 启动状态在确认期间变化，请重新选择操作并确认。'; return 0; }
+    "$SSHD" -t -f "$SSHD_CONFIG" || { warn '确认后配置验证失败，未修改。'; return 1; }
     [[ ! -L $SSH_DROPIN && ( ! -e $SSH_DROPIN || -f $SSH_DROPIN ) ]] || return 1
     mkdir -p -- "$BACKUP_ROOT" && chmod 700 "$BACKUP_ROOT" || return 1
     SSH_BACKUP=$(mktemp -d "$BACKUP_ROOT/ssh-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX") || return 1
     cp -p -- "$SSHD_CONFIG" "$SSH_BACKUP/sshd_config" || return 1
-    SSH_PREVIOUS_EXISTS=0; SSH_RELOAD_ATTEMPTED=0; SSH_ROLLBACK_FAILED=0
+    SSH_PREVIOUS_EXISTS=0; SSH_RELOAD_ATTEMPTED=0; SSH_ROLLBACK_FAILED=0; SSH_MODE_CHANGED=0
+    SSH_ORIGINAL_SERVICE_ACTIVE=$(ssh_active_state "$SSH_SERVICE") || return 1
+    SSH_ORIGINAL_SERVICE_ENABLED=$(ssh_enabled_state "$SSH_SERVICE") || return 1
+    SSH_ORIGINAL_SOCKET_ACTIVE=unknown; SSH_ORIGINAL_SOCKET_ENABLED=not-found
+    if [[ -n $SSH_SOCKET ]]; then
+        SSH_ORIGINAL_SOCKET_ACTIVE=$(ssh_active_state "$SSH_SOCKET") || return 1
+        SSH_ORIGINAL_SOCKET_ENABLED=$(ssh_enabled_state "$SSH_SOCKET") || return 1
+    fi
+    [[ "$SSH_SERVICE:$SSH_ORIGINAL_SERVICE_ACTIVE:$SSH_ORIGINAL_SERVICE_ENABLED:$SSH_SOCKET:$SSH_ORIGINAL_SOCKET_ACTIVE:$SSH_ORIGINAL_SOCKET_ENABLED" == "$planned_state" ]] || { warn '备份时 SSH 启动状态变化，未修改。'; return 1; }
+    printf 'Service=%s\nServiceActive=%s\nServiceEnabled=%s\nSocket=%s\nSocketActive=%s\nSocketEnabled=%s\n' "$SSH_SERVICE" "$SSH_ORIGINAL_SERVICE_ACTIVE" "$SSH_ORIGINAL_SERVICE_ENABLED" "$SSH_SOCKET" "$SSH_ORIGINAL_SOCKET_ACTIVE" "$SSH_ORIGINAL_SOCKET_ENABLED" > "$SSH_BACKUP/service-state" || return 1
     if [[ -e $SSH_DROPIN ]]; then
         cp -p -- "$SSH_DROPIN" "$SSH_BACKUP/00-key-only.conf" || return 1
         SSH_PREVIOUS_EXISTS=1
@@ -584,13 +797,14 @@ disable_ssh_password_auth() {
     if ! "$SSHD" -t -f "$SSHD_CONFIG"; then rollback_ssh; return 1; fi
     if ! verify_key_only; then report_ssh_conflicts; rollback_ssh; return 1; fi
     if ! check_ssh_reload_mode; then rollback_ssh; return 1; fi
-    SSH_RELOAD_ATTEMPTED=1
-    if ! systemctl reload "$SSH_SERVICE"; then rollback_ssh; return 1; fi
-    if ! check_ssh_service_health || ! verify_key_only; then rollback_ssh; return 1; fi
+    if [[ $SSH_RUNTIME_STATE != "$planned_state" ]]; then warn 'SSH 启动状态发生变化，取消应用。'; rollback_ssh; return 1; fi
+    if ! apply_ssh_configuration || ! verify_key_only; then rollback_ssh; return 1; fi
     SSH_TRANSACTION=0
+    SSH_MODE_CHANGED=0
     say "SSH 配置已生效。备份: $SSH_BACKUP"
     config=$(get_effective_sshd_config) || return 1
     show_ssh_values "$config"
+    show_ssh_runtime_status
     say 'Current SSH session has not been terminated.'
     say 'Before closing it, open a NEW terminal and verify key-based login works.'
 }
@@ -630,6 +844,39 @@ basic_init() {
     fi
     if [[ -e /var/run/reboot-required ]]; then say 'Reboot required.'; else say 'Reboot not required.'; fi
 }
+show_ssh_runtime_status() {
+    local unit service='' socket='' service_state=unknown socket_state=unknown enabled=unknown listeners owner=none mode=unknown
+    if command -v systemctl >/dev/null; then
+        for unit in ssh.service sshd.service; do
+            if [[ $(systemctl show "$unit" -p LoadState --value 2>/dev/null) == loaded ]]; then service=$unit; break; fi
+        done
+        for unit in ssh.socket sshd.socket; do
+            if [[ $(systemctl show "$unit" -p LoadState --value 2>/dev/null) == loaded ]]; then socket=$unit; break; fi
+        done
+        if [[ -n $service ]]; then service_state=$(ssh_active_state "$service") || service_state=unknown; mode=service; fi
+        if [[ -n $socket ]]; then
+            socket_state=$(ssh_active_state "$socket") || socket_state=unknown
+            enabled=$(ssh_enabled_state "$socket") || enabled=unknown
+            [[ $socket_state != active ]] || mode='socket-activated'
+        else
+            socket_state=not-found; enabled=not-found
+        fi
+    fi
+    if listeners=$(ssh_port22_listeners 2>/dev/null); then
+        if [[ -n $listeners ]]; then
+            owner=other
+            if [[ $listeners == *'("sshd",'* ]]; then owner=sshd; fi
+            if [[ $listeners == *'pid=1,'* ]]; then
+                mode='socket-activated'
+                if [[ $owner == sshd ]]; then owner='systemd + sshd'; else owner=systemd; fi
+            fi
+        fi
+    else owner=unknown
+    fi
+    say "Mode: $mode"; say "Service: $service_state${service:+ ($service)}"
+    say "Socket: $socket_state${socket:+ ($socket)}, enabled: $enabled"
+    say "Port 22 listener: $owner"
+}
 show_status() {
     local user config package admin=no key=no safe=no
     say ''; say 'System'; say '------'
@@ -643,6 +890,7 @@ show_status() {
         if (( $(count_authorized_keys "$user") > 0 )); then key=yes; fi
     done < <(list_login_users)
     say ''; say 'SSH (磁盘配置经 sshd -T 解析；不等于实际登录验证)'; say '---'
+    show_ssh_runtime_status
     if config=$(get_effective_sshd_config); then show_ssh_values "$config"; else say 'unknown'; fi
     say ''; say 'Packages'; say '--------'
     for package in "${BASIC_PACKAGES[@]}"; do

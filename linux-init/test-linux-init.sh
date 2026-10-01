@@ -26,6 +26,7 @@ SSH_DROPIN_DIR="$TEST_ROOT/ssh/sshd_config.d"
 SSH_DROPIN="$SSH_DROPIN_DIR/00-key-only.conf"
 SSH_ENV_FILES=("$TEST_ROOT/default-ssh")
 BACKUP_ROOT="$TEST_ROOT/backups"
+SSH_RUNTIME_DIR="$TEST_ROOT/run/sshd"
 mkdir -p "$WORK_DIR" "$SSH_DROPIN_DIR" "$TEST_ROOT/home/ppy" "$TEST_ROOT/home/admin"
 SSHD=$(command -v sshd || true)
 [[ -n $SSHD ]] || SSHD=/usr/sbin/sshd
@@ -94,36 +95,89 @@ stat() {
     command stat -f "$bsd" "$path"
 }
 systemctl() {
+    local unit=${!#} state command_line="$*"
     case "$1" in
-        is-active) case "${!#}" in
-            *.socket) [[ $FAKE_SOCKET_ACTIVE != yes ]] || return 0; return 3 ;;
-            *.service) [[ $FAKE_SERVICE_ACTIVE != yes ]] || return 0; return 3 ;;
-            *) return 4 ;;
-        esac ;;
-        reload) printf 'reload %s\n' "$2" >> "$LOG"
-                if (( RELOAD_EXIT )); then FAKE_SERVICE_ACTIVE=no; return 1; fi
-                if (( RELOAD_PERSISTENT_FAILURE )); then return 1; fi
-                if (( RELOAD_FAIL )); then RELOAD_FAIL=0; return 1; fi ;;
+        is-active)
+            case "$unit" in
+                *.socket) if [[ $FAKE_SOCKET_ACTIVE == yes ]]; then state=active; else state=inactive; fi ;;
+                *.service) if [[ $FAKE_SERVICE_ACTIVE == yes ]]; then state=active; else state=inactive; fi ;;
+                *) state=unknown ;;
+            esac
+            [[ $2 == --quiet ]] || printf '%s\n' "$state"
+            [[ $state == active ]] || return 3 ;;
+        is-enabled)
+            case "$unit" in *.socket) state=$FAKE_SOCKET_ENABLED ;; *.service) state=$FAKE_SERVICE_ENABLED ;; *) state=not-found ;; esac
+            printf '%s\n' "$state"
+            [[ $state == enabled || $state == enabled-runtime ]] || return 1 ;;
+        reload|stop|disable|enable|reset-failed|start)
+            printf '%s\n' "$command_line" >> "$LOG"
+            if [[ $command_line == "$FAIL_SERVICE_STEP" ]]; then FAIL_SERVICE_STEP=''; return 1; fi
+            [[ $command_line != "$FAIL_PERSISTENT_STEP" ]] || return 1
+            case "$1" in
+                reload)
+                    if (( RELOAD_EXIT )); then FAKE_SERVICE_ACTIVE=no; rm -rf "$SSH_RUNTIME_DIR"; return 1; fi
+                    if (( RELOAD_PERSISTENT_FAILURE )); then return 1; fi
+                    if (( RELOAD_FAIL )); then RELOAD_FAIL=0; return 1; fi ;;
+                stop)
+                    case "$unit" in *.socket) FAKE_SOCKET_ACTIVE=no ;; *.service) FAKE_SERVICE_ACTIVE=no; rm -rf "$SSH_RUNTIME_DIR" ;; esac ;;
+                disable) case "$unit" in *.socket) FAKE_SOCKET_ENABLED=disabled ;; *.service) FAKE_SERVICE_ENABLED=disabled ;; esac ;;
+                enable)
+                    state=enabled; [[ $2 != --runtime ]] || state='enabled-runtime'
+                    case "$unit" in *.socket) FAKE_SOCKET_ENABLED=$state ;; *.service) FAKE_SERVICE_ENABLED=$state ;; esac ;;
+                start)
+                    case "$unit" in
+                        *.socket) FAKE_SOCKET_ACTIVE=yes ;;
+                        *.service) FAKE_SERVICE_ACTIVE=yes; mkdir -p "$SSH_RUNTIME_DIR"; RELOAD_DELAYED_EXIT=0 ;;
+                    esac ;;
+            esac
+            case "$FAKE_SOCKET_ACTIVE:$FAKE_SERVICE_ACTIVE" in
+                yes:yes) FAKE_LISTENER_OWNER=shared ;;
+                yes:no) FAKE_LISTENER_OWNER=systemd ;;
+                no:yes) FAKE_LISTENER_OWNER=sshd ;;
+                no:no) FAKE_LISTENER_OWNER=missing ;;
+            esac
+            if [[ $1 == start && $unit == *.service && -n $FAULT_AFTER_START ]]; then
+                case "$FAULT_AFTER_START" in owner) FAKE_LISTENER_OWNER=missing ;; service) FAKE_SERVICE_ACTIVE=no ;; esac
+                FAULT_AFTER_START=''
+            fi ;;
         show) case "$*" in
-            *ActiveState*) if [[ $FAKE_SOCKET_ACTIVE == yes ]]; then printf 'active\n'; else printf 'inactive\n'; fi ;;
-            *UnitFileState*) printf '%s\n' "$FAKE_SOCKET_ENABLED" ;;
-            *MainPID*) printf '4321\n' ;;
+            *LoadState*)
+                if [[ $2 == *.socket && ( $2 == sshd.socket || $FAKE_NO_SOCKET == yes ) ]] || [[ $2 == ssh.service && $FAKE_SERVICE_ID == sshd.service ]]; then
+                    printf 'not-found\n'
+                else printf 'loaded\n'; fi ;;
+            *' -p Id '*) if [[ $2 == *.service ]]; then printf '%s\n' "$FAKE_SERVICE_ID"; else printf '%s\n' "$2"; fi ;;
+            *MainPID*) if [[ $FAKE_SERVICE_ACTIVE == yes ]]; then printf '4321\n'; else printf '0\n'; fi ;;
             *TriggeredBy*) printf '%s\n' "$FAKE_TRIGGERED_BY" ;;
             *Sockets*) printf '%s\n' "$FAKE_SOCKETS" ;;
+            *ExecStartPre*) if [[ $2 == *.service ]]; then printf '{ path=/usr/sbin/sshd ; argv[]=/usr/sbin/sshd -t ; ignore_errors=no ; }\n'; else printf '\n'; fi ;;
+            *ExecStartPost*) printf '%s\n' "$FAKE_START_HOOK" ;;
             *ExecStart*) printf '{ path=/usr/sbin/sshd ; argv[]=/usr/sbin/sshd -D $SSHD_OPTS ; ignore_errors=no ; }\n' ;;
             *EnvironmentFiles*) printf '%s\n' "$FAKE_ENVIRONMENT_FILES" ;;
             *Environment*) printf '\n' ;;
             *CanReload*) printf 'yes\n' ;;
-            *) return 1 ;;
+            *KillMode*) printf '%s\n' "$FAKE_KILL_MODE" ;;
+            *SendSIGHUP*) printf '%s\n' "$FAKE_SEND_HUP" ;;
+            *KillSignal*) printf '15\n' ;;
+            *ExecStop*) printf '%s\n' "$FAKE_STOP_HOOK" ;;
+            *Requires*|*Wants*|*BindsTo*) printf '%s\n' "$FAKE_DEPENDENCIES" ;;
+            *Accept*) printf 'no\n' ;;
+            *Listen*) printf '%s\n' "$FAKE_SOCKET_LISTEN" ;;
+            *' -p Triggers '*) printf '%s\n' "$FAKE_SERVICE_ID" ;;
+            *) printf 'Unexpected show property: %s\n' "$*" >&2; return 1 ;;
         esac ;;
         *) printf 'Unexpected service command!\n' >&2; return 1 ;;
     esac
+}
+install() {
+    [[ ${!#} == "$SSH_RUNTIME_DIR" ]] || { printf 'Unexpected install!\n' >&2; return 1; }
+    mkdir -p "$SSH_RUNTIME_DIR"
 }
 ss() {
     case "$FAKE_LISTENER_OWNER" in
         sshd) printf 'LISTEN 0 128 *:22 *:* users:(("sshd",pid=4321,fd=3))\n' ;;
         shared) printf 'LISTEN 0 128 *:22 *:* users:(("sshd",pid=4321,fd=3),("systemd",pid=1,fd=87))\n' ;;
         systemd) printf 'LISTEN 0 128 *:22 *:* users:(("systemd",pid=1,fd=87))\n' ;;
+        wrongport) printf 'LISTEN 0 128 *:443 *:* users:(("sshd",pid=4321,fd=3))\n' ;;
         missing) printf 'LISTEN 0 128 *:443 *:* users:(("caddy",pid=3758,fd=6))\n' ;;
         error) return 1 ;;
     esac
@@ -136,7 +190,7 @@ sleep() {
 # Count validation failures without touching the actual daemon.
 real_sshd=$SSHD
 sshd_test() {
-    if [[ $1 == -t && $FAKE_SERVICE_ACTIVE == no ]]; then printf 'Missing privilege separation directory: /run/sshd\n' >&2; return 1; fi
+    if [[ $1 == -t && ! -d $SSH_RUNTIME_DIR ]]; then printf 'Missing privilege separation directory: /run/sshd\n' >&2; return 1; fi
     if [[ $1 == -t && -f $SSH_DROPIN ]] && grep -q 'PasswordAuthentication no' "$SSH_DROPIN" && (( SYNTAX_FAIL )); then return 1; fi
     "$real_sshd" "$@"
 }
@@ -153,13 +207,18 @@ reset_config() {
     SSH_TRANSACTION=0; SSH_RELOAD_ATTEMPTED=0; SSH_ROLLBACK_FAILED=0; SYNTAX_FAIL=0; RELOAD_FAIL=0
     RELOAD_EXIT=0; RELOAD_PERSISTENT_FAILURE=0; RELOAD_DELAYED_EXIT=0; RELOAD_LOST_LISTENER=0
     FAKE_TRIGGERED_BY=''; FAKE_SOCKETS=''; FAKE_SOCKET_ACTIVE=no; FAKE_SERVICE_ACTIVE=yes
-    FAKE_SOCKET_ENABLED=enabled; FAKE_LISTENER_OWNER=sshd
+    FAKE_SOCKET_ENABLED=disabled; FAKE_LISTENER_OWNER=sshd
+    FAKE_SERVICE_ENABLED=enabled; FAKE_KILL_MODE=process; FAKE_SEND_HUP=no; FAKE_STOP_HOOK=''; FAKE_DEPENDENCIES=''; FAKE_START_HOOK=''
+    FAKE_SOCKET_LISTEN='[::]:22 (Stream)'; FAIL_SERVICE_STEP=''; FAIL_PERSISTENT_STEP=''; FAULT_AFTER_START=''; SSH_MODE_CHANGED=0
+    FAKE_SERVICE_ID=ssh.service; FAKE_NO_SOCKET=no
+    mkdir -p "$SSH_RUNTIME_DIR"
 }
 set_users() {
     printf 'root:x:0:0:root:%s:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\nppy:x:1000:1000::%s:/bin/bash\nadmin:x:1001:1001::%s:/bin/bash\nservice:x:1002:1002::/srv/service:/bin/false\n' "$TEST_ROOT/root" "$TEST_ROOT/home/ppy" "$TEST_ROOT/home/admin" > "$PASSWD_FIXTURE"
     printf 'ppy:$6$fixture:20000:0:99999:7:::\nadmin:!:20000:0:99999:7:::\n' > "$SHADOW_FIXTURE"
 }
 
+reset_config
 set_users
 assert_eq "$(list_login_users)" $'ppy\nadmin' 'exclude system/root/nologin users'
 ok 'login-user discovery'
@@ -246,17 +305,11 @@ if find_ssh_service; then fail 'custom service options accepted'; fi
 rm "${SSH_ENV_FILES[0]}"
 ok 'configuration precedence, Match and service-option refusal'
 
-for socket_case in triggered active explicit; do
-    reset_config
-    case "$socket_case" in
-        triggered) FAKE_TRIGGERED_BY=ssh.socket ;;
-        active) FAKE_SOCKET_ACTIVE=yes ;;
-        explicit) FAKE_SOCKETS=custom-ssh.socket ;;
-    esac
-    disable_ssh_password_auth <<< y >/dev/null 2>&1
-    [[ ! -f $SSH_DROPIN && ! -s $LOG ]] || fail "socket case $socket_case wrote or reloaded"
-done
-ok 'socket activation: TriggeredBy, active socket and Sockets refuse before writes'
+reset_config
+FAKE_SOCKETS=custom-ssh.socket
+disable_ssh_password_auth <<< y >/dev/null 2>&1
+[[ ! -f $SSH_DROPIN && ! -s $LOG ]] || fail 'custom socket wrote or reloaded'
+ok 'custom explicit Sockets refuses before writes'
 
 reset_config
 FAKE_TRIGGERED_BY=ssh.socket
@@ -264,7 +317,7 @@ FAKE_SOCKET_ENABLED=disabled
 find_ssh_service || fail 'inactive disabled socket relationship blocked classic daemon'
 ok 'inactive disabled socket metadata permits independently listening daemon'
 
-for owner_case in systemd shared missing error; do
+for owner_case in systemd shared missing error wrongport; do
     reset_config
     FAKE_TRIGGERED_BY=ssh.socket
     FAKE_SOCKET_ENABLED=disabled
@@ -281,6 +334,150 @@ reset_config
 )
 [[ ! -f $SSH_DROPIN && ! -s $LOG ]] || fail 'socket activated during confirmation was not caught'
 ok 'socket activated during operator verification: recheck before writes'
+
+# Exercise Debian 13/LXC socket -> service conversion, never a live systemd.
+for mode_case in both socket-only enabled-inactive runtime-enabled alias-service; do
+    reset_config
+    FAKE_TRIGGERED_BY=ssh.socket
+    FAKE_SOCKET_ACTIVE=yes; FAKE_SOCKET_ENABLED=enabled; FAKE_LISTENER_OWNER=shared
+    case "$mode_case" in
+        socket-only) FAKE_SERVICE_ACTIVE=no; FAKE_SERVICE_ENABLED=disabled; FAKE_LISTENER_OWNER=systemd ;;
+        enabled-inactive) FAKE_SOCKET_ACTIVE=no; FAKE_LISTENER_OWNER=sshd ;;
+        runtime-enabled) FAKE_SOCKET_ENABLED='enabled-runtime'; FAKE_SERVICE_ENABLED='enabled-runtime' ;;
+        alias-service) FAKE_SERVICE_ID=sshd.service ;;
+    esac
+    show_ssh_runtime_status > "$TEST_ROOT/status"
+    if [[ $FAKE_SOCKET_ACTIVE == yes ]]; then grep -q 'Mode: socket-activated' "$TEST_ROOT/status" || fail 'socket status mode'; fi
+    disable_ssh_password_auth <<< y > "$TEST_ROOT/migration-output" 2>&1 || { cat "$TEST_ROOT/migration-output"; fail "migration $mode_case failed"; }
+    assert_eq "$FAKE_SERVICE_ACTIVE" yes 'migration service not active'
+    assert_eq "$FAKE_SERVICE_ENABLED" enabled 'migration service not enabled'
+    assert_eq "$FAKE_SOCKET_ACTIVE" no 'migration socket not stopped'
+    assert_eq "$FAKE_SOCKET_ENABLED" disabled 'migration socket not disabled'
+    assert_eq "$FAKE_LISTENER_OWNER" sshd 'migration listener not sshd'
+    [[ -f $SSH_BACKUP/service-state ]] || fail 'missing unit-state backup'
+    if grep -q '^reload ' "$LOG"; then fail "migration $mode_case sent HUP"; fi
+    grep -q "^stop $FAKE_SERVICE_ID" "$LOG" || fail 'active service was not stopped before fresh start'
+    grep -q 'Mode: service' "$TEST_ROOT/migration-output" || fail 'final service mode not shown'
+    key_only_values "$(get_effective_sshd_config)" || fail 'migration lost auth settings'
+    cp "$LOG" "$TEST_ROOT/migrated-actions"
+    disable_ssh_password_auth <<< y >/dev/null
+    cmp "$LOG" "$TEST_ROOT/migrated-actions" || fail 'migrated action not idempotent'
+done
+ok 'socket migration: both active, socket-only, enabled inactive, runtime enabled, sshd alias; no HUP'
+
+# Already hardened socket installations must still migrate after confirmation.
+reset_config
+FAKE_SOCKET_ACTIVE=yes; FAKE_SOCKET_ENABLED=enabled; FAKE_LISTENER_OWNER=shared
+printf 'PubkeyAuthentication yes\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin no\n' > "$SSH_DROPIN"
+disable_ssh_password_auth <<< n >/dev/null
+[[ ! -s $LOG ]] || fail 'cancelled migration changed units'
+disable_ssh_password_auth <<< y >/dev/null
+assert_eq "$FAKE_SOCKET_ACTIVE" no 'already hardened socket skipped migration'
+ok 'already key-only socket still requires confirmation and migrates'
+
+for unsafe_case in kill-mode hup hook start-hook dependency socket-port sshd-port sshd-address missing-listener; do
+    reset_config
+    FAKE_SOCKET_ACTIVE=yes; FAKE_SOCKET_ENABLED=enabled; FAKE_LISTENER_OWNER=shared
+    case "$unsafe_case" in
+        kill-mode) FAKE_KILL_MODE=control-group ;;
+        hup) FAKE_SEND_HUP=yes ;;
+        hook) FAKE_STOP_HOOK='/usr/bin/custom-stop' ;;
+        start-hook) FAKE_START_HOOK='/usr/bin/custom-start' ;;
+        dependency) FAKE_DEPENDENCIES=ssh.socket ;;
+        socket-port) FAKE_SOCKET_LISTEN='[::]:2222 (Stream)' ;;
+        sshd-port) printf 'Port 2222\n' >> "$SSHD_CONFIG" ;;
+        sshd-address) printf 'ListenAddress 127.0.0.1\n' >> "$SSHD_CONFIG" ;;
+        missing-listener) FAKE_LISTENER_OWNER=missing ;;
+    esac
+    disable_ssh_password_auth <<< y >/dev/null 2>&1
+    [[ ! -f $SSH_DROPIN && ! -s $LOG ]] || fail "unsafe migration $unsafe_case changed host"
+done
+ok 'migration refuses unsafe stop policy, hooks, dependencies and nonstandard listening'
+
+reset_config
+FAKE_SOCKET_ACTIVE=yes; FAKE_SOCKET_ENABLED=enabled; FAKE_LISTENER_OWNER=shared
+printf 'InvalidSSHDirective yes\n' >> "$SSHD_CONFIG"
+if disable_ssh_password_auth <<< y > "$TEST_ROOT/failure-output" 2>&1; then fail 'original syntax failure returned success'; fi
+[[ ! -f $SSH_DROPIN && ! -s $LOG ]] || fail 'original syntax failure touched configuration/units'
+reset_config
+FAKE_SOCKET_ACTIVE=yes; FAKE_SOCKET_ENABLED=enabled; FAKE_LISTENER_OWNER=shared
+rm -rf "$SSH_RUNTIME_DIR"
+if disable_ssh_password_auth <<< y > "$TEST_ROOT/failure-output" 2>&1; then fail 'missing runtime directory bypassed syntax gate'; fi
+[[ ! -d $SSH_RUNTIME_DIR && ! -f $SSH_DROPIN && ! -s $LOG ]] || fail 'initial -t failure was bypassed'
+reset_config
+FAKE_SOCKET_ACTIVE=yes; FAKE_SOCKET_ENABLED=enabled; FAKE_LISTENER_OWNER=shared
+SYNTAX_FAIL=1
+if disable_ssh_password_auth <<< y >/dev/null 2>&1; then fail 'candidate syntax failure succeeded'; fi
+[[ ! -f $SSH_DROPIN ]] || fail 'candidate syntax failure retained dropin'
+if grep -qE '^(stop|disable|enable|start|reset-failed|reload) ' "$LOG"; then fail 'candidate syntax failure touched units'; fi
+ok 'original/candidate -t gates forbid all service changes, including missing runtime directory'
+
+# One failure at each mutation step must restore config AND original unit states.
+for fault in 'stop ssh.socket' 'disable ssh.socket' 'stop ssh.service' 'reset-failed ssh.service' 'enable ssh.service' 'start ssh.service' owner service; do
+    reset_config
+    FAKE_TRIGGERED_BY=ssh.socket
+    FAKE_SOCKET_ACTIVE=yes; FAKE_SOCKET_ENABLED=enabled; FAKE_LISTENER_OWNER=shared
+    printf 'PasswordAuthentication yes\n' > "$SSH_DROPIN"
+    cp "$SSH_DROPIN" "$TEST_ROOT/old-dropin"
+    case "$fault" in owner|service) FAULT_AFTER_START=$fault ;; *) FAIL_SERVICE_STEP=$fault ;; esac
+    if disable_ssh_password_auth <<< y > "$TEST_ROOT/failure-output" 2>&1; then fail "migration fault $fault reported success"; fi
+    cmp "$SSH_DROPIN" "$TEST_ROOT/old-dropin" || fail "migration fault $fault lost config"
+    assert_eq "$FAKE_SERVICE_ACTIVE" yes 'rollback service activity'
+    assert_eq "$FAKE_SERVICE_ENABLED" enabled 'rollback service enable state'
+    assert_eq "$FAKE_SOCKET_ACTIVE" yes 'rollback socket activity'
+    assert_eq "$FAKE_SOCKET_ENABLED" enabled 'rollback socket enable state'
+    assert_eq "$SSH_ROLLBACK_FAILED" 0 "migration fault $fault recovery failed"
+    [[ $FAKE_LISTENER_OWNER == shared ]] || fail 'rollback did not restore port 22'
+    if grep -q '^reload ' "$LOG"; then fail "migration fault $fault reloads socket service"; fi
+    cp "$LOG" "$TEST_ROOT/restored-actions"
+    rollback_ssh >/dev/null
+    cmp "$LOG" "$TEST_ROOT/restored-actions" || fail 'rollback retried after restoration'
+done
+ok 'each migration step/health failure restores original config, enabled states and socket listener without HUP'
+
+for recovery_case in socket-only enabled-inactive runtime-enabled; do
+    reset_config
+    FAKE_SOCKET_ACTIVE=yes; FAKE_SOCKET_ENABLED=enabled; FAKE_LISTENER_OWNER=shared
+    case "$recovery_case" in
+        socket-only) FAKE_SERVICE_ACTIVE=no; FAKE_SERVICE_ENABLED=disabled; FAKE_LISTENER_OWNER=systemd ;;
+        enabled-inactive) FAKE_SOCKET_ACTIVE=no; FAKE_LISTENER_OWNER=sshd ;;
+        runtime-enabled) FAKE_SOCKET_ENABLED='enabled-runtime'; FAKE_SERVICE_ENABLED='enabled-runtime' ;;
+    esac
+    expected_service_active=$FAKE_SERVICE_ACTIVE; expected_service_enabled=$FAKE_SERVICE_ENABLED
+    expected_socket_active=$FAKE_SOCKET_ACTIVE; expected_socket_enabled=$FAKE_SOCKET_ENABLED
+    FAIL_SERVICE_STEP='start ssh.service'
+    if disable_ssh_password_auth <<< y >/dev/null 2>&1; then fail 'fault returned success'; fi
+    assert_eq "$FAKE_SERVICE_ACTIVE" "$expected_service_active" 'restore original service activity'
+    assert_eq "$FAKE_SERVICE_ENABLED" "$expected_service_enabled" 'restore original service enable state'
+    assert_eq "$FAKE_SOCKET_ACTIVE" "$expected_socket_active" 'restore original socket activity'
+    assert_eq "$FAKE_SOCKET_ENABLED" "$expected_socket_enabled" 'restore original socket enable state'
+    assert_eq "$SSH_ROLLBACK_FAILED" 0 'restore variant failed'
+    [[ ! -f $SSH_DROPIN ]] || fail 'new dropin not deleted'
+done
+ok 'rollback preserves socket-only, inactive enabled and runtime-enabled original modes'
+
+reset_config
+FAKE_SOCKET_ACTIVE=yes; FAKE_SOCKET_ENABLED=enabled; FAKE_LISTENER_OWNER=shared
+FAIL_PERSISTENT_STEP='start ssh.service'
+if disable_ssh_password_auth <<< y > "$TEST_ROOT/failure-output" 2>&1; then fail 'persistent migration failure returned success'; fi
+assert_eq "$SSH_ROLLBACK_FAILED" 1 'terminal migration recovery failure not flagged'
+assert_eq "$FAKE_SOCKET_ACTIVE" yes 'recovery did not restore socket listener despite dead service'
+grep -q 'Port 22 listener: systemd' "$TEST_ROOT/failure-output" || fail 'failed recovery omitted final listener report'
+cp "$LOG" "$TEST_ROOT/failed-actions"
+rollback_ssh >> "$TEST_ROOT/failure-output" 2>&1 || true
+rollback_ssh >> "$TEST_ROOT/failure-output" 2>&1 || true
+cmp "$LOG" "$TEST_ROOT/failed-actions" || fail 'terminal migration rollback repeated'
+assert_eq "$(grep -c '已恢复 SSH drop-in' "$TEST_ROOT/failure-output")" 1 'migration recovery duplicate warnings'
+ok 'persistent recovery failure reports remaining 22 listener and never loops'
+
+reset_config
+FAKE_NO_SOCKET=yes
+find_ssh_service || fail 'classic service without socket unit rejected'
+show_ssh_runtime_status > "$TEST_ROOT/status"
+grep -q 'Mode: service' "$TEST_ROOT/status" || fail 'classic mode missing'
+grep -q 'Socket: not-found' "$TEST_ROOT/status" || fail 'missing socket status wrong'
+grep -q 'Port 22 listener: sshd' "$TEST_ROOT/status" || fail 'sshd listener status missing'
+ok 'readonly status and classic service without socket unit'
 
 reset_config
 SUDO_MEMBER=no
@@ -329,7 +526,9 @@ for exit_case in immediate delayed; do
     assert_eq "$(grep -c '^reload ' "$LOG")" 1 'dead daemon received another reload'
     assert_eq "$(grep -c '已恢复 SSH drop-in' "$TEST_ROOT/failure-output")" 1 'duplicate restore warning'
     if grep -q 'Missing privilege separation directory' "$TEST_ROOT/failure-output"; then fail 'validated stopped daemon with missing runtime dir'; fi
-    assert_eq "$SSH_ROLLBACK_FAILED" 1 'service recovery failure flag missing'
+    assert_eq "$SSH_ROLLBACK_FAILED" 0 'dead service was not recovered'
+    assert_eq "$FAKE_SERVICE_ACTIVE" yes 'restored service not active'
+    assert_eq "$(grep -c '^start ssh.service' "$LOG")" 1 'dead service not started'
 done
 ok 'daemon exits on/after reload: restore once, no inactive reload or repeated rollback'
 
