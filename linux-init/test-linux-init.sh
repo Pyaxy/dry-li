@@ -9,7 +9,17 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 source "$SCRIPT_DIR/linux-init.sh"
 TEST_ROOT=$(mktemp -d)
 TEST_ROOT=$(cd "$TEST_ROOT" && pwd -P)
-trap 'rm -rf -- "$TEST_ROOT"' EXIT
+TEST_COMPLETED=0
+test_cleanup() {
+    local status=$?
+    rm -rf -- "$TEST_ROOT"
+    if (( TEST_COMPLETED != 1 )); then
+        printf 'FAIL: test suite did not reach completion.\n' >&2
+        exit 1
+    fi
+    exit "$status"
+}
+trap test_cleanup EXIT
 WORK_DIR="$TEST_ROOT/work"
 SSHD_CONFIG="$TEST_ROOT/ssh/sshd_config"
 SSH_DROPIN_DIR="$TEST_ROOT/ssh/sshd_config.d"
@@ -38,10 +48,13 @@ FAKE_ENVIRONMENT_FILES=''
 FAKE_TRIGGERED_BY=''
 FAKE_SOCKETS=''
 FAKE_SOCKET_ACTIVE=no
+FAKE_SOCKET_ENABLED=enabled
+FAKE_LISTENER_OWNER=sshd
 FAKE_SERVICE_ACTIVE=yes
 RELOAD_EXIT=0
 RELOAD_PERSISTENT_FAILURE=0
 RELOAD_DELAYED_EXIT=0
+RELOAD_LOST_LISTENER=0
 
 # No actual user, group, package, ownership or service mutations are permitted.
 getent() {
@@ -92,6 +105,9 @@ systemctl() {
                 if (( RELOAD_PERSISTENT_FAILURE )); then return 1; fi
                 if (( RELOAD_FAIL )); then RELOAD_FAIL=0; return 1; fi ;;
         show) case "$*" in
+            *ActiveState*) if [[ $FAKE_SOCKET_ACTIVE == yes ]]; then printf 'active\n'; else printf 'inactive\n'; fi ;;
+            *UnitFileState*) printf '%s\n' "$FAKE_SOCKET_ENABLED" ;;
+            *MainPID*) printf '4321\n' ;;
             *TriggeredBy*) printf '%s\n' "$FAKE_TRIGGERED_BY" ;;
             *Sockets*) printf '%s\n' "$FAKE_SOCKETS" ;;
             *ExecStart*) printf '{ path=/usr/sbin/sshd ; argv[]=/usr/sbin/sshd -D $SSHD_OPTS ; ignore_errors=no ; }\n' ;;
@@ -103,9 +119,19 @@ systemctl() {
         *) printf 'Unexpected service command!\n' >&2; return 1 ;;
     esac
 }
+ss() {
+    case "$FAKE_LISTENER_OWNER" in
+        sshd) printf 'LISTEN 0 128 *:22 *:* users:(("sshd",pid=4321,fd=3))\n' ;;
+        shared) printf 'LISTEN 0 128 *:22 *:* users:(("sshd",pid=4321,fd=3),("systemd",pid=1,fd=87))\n' ;;
+        systemd) printf 'LISTEN 0 128 *:22 *:* users:(("systemd",pid=1,fd=87))\n' ;;
+        missing) printf 'LISTEN 0 128 *:443 *:* users:(("caddy",pid=3758,fd=6))\n' ;;
+        error) return 1 ;;
+    esac
+}
 sleep() {
     # Simulate a daemon failing after systemctl reload already returned success.
     if (( RELOAD_DELAYED_EXIT )); then FAKE_SERVICE_ACTIVE=no; fi
+    if (( RELOAD_LOST_LISTENER )); then FAKE_LISTENER_OWNER=missing; fi
 } # No wall-clock waits in mocked service-health sampling.
 # Count validation failures without touching the actual daemon.
 real_sshd=$SSHD
@@ -125,8 +151,9 @@ reset_config() {
     printf 'PasswordAuthentication yes\n' > "$SSH_DROPIN_DIR/50-cloud-init.conf"
     : > "$LOG"
     SSH_TRANSACTION=0; SSH_RELOAD_ATTEMPTED=0; SSH_ROLLBACK_FAILED=0; SYNTAX_FAIL=0; RELOAD_FAIL=0
-    RELOAD_EXIT=0; RELOAD_PERSISTENT_FAILURE=0; RELOAD_DELAYED_EXIT=0
+    RELOAD_EXIT=0; RELOAD_PERSISTENT_FAILURE=0; RELOAD_DELAYED_EXIT=0; RELOAD_LOST_LISTENER=0
     FAKE_TRIGGERED_BY=''; FAKE_SOCKETS=''; FAKE_SOCKET_ACTIVE=no; FAKE_SERVICE_ACTIVE=yes
+    FAKE_SOCKET_ENABLED=enabled; FAKE_LISTENER_OWNER=sshd
 }
 set_users() {
     printf 'root:x:0:0:root:%s:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\nppy:x:1000:1000::%s:/bin/bash\nadmin:x:1001:1001::%s:/bin/bash\nservice:x:1002:1002::/srv/service:/bin/false\n' "$TEST_ROOT/root" "$TEST_ROOT/home/ppy" "$TEST_ROOT/home/admin" > "$PASSWD_FIXTURE"
@@ -232,6 +259,22 @@ done
 ok 'socket activation: TriggeredBy, active socket and Sockets refuse before writes'
 
 reset_config
+FAKE_TRIGGERED_BY=ssh.socket
+FAKE_SOCKET_ENABLED=disabled
+find_ssh_service || fail 'inactive disabled socket relationship blocked classic daemon'
+ok 'inactive disabled socket metadata permits independently listening daemon'
+
+for owner_case in systemd shared missing error; do
+    reset_config
+    FAKE_TRIGGERED_BY=ssh.socket
+    FAKE_SOCKET_ENABLED=disabled
+    FAKE_LISTENER_OWNER=$owner_case
+    disable_ssh_password_auth <<< y >/dev/null 2>&1
+    [[ ! -f $SSH_DROPIN && ! -s $LOG ]] || fail "listener owner $owner_case wrote or reloaded"
+done
+ok 'listener ownership: systemd, shared, missing or query error refuses before writes'
+
+reset_config
 (
     confirm() { FAKE_SOCKET_ACTIVE=yes; return 0; }
     disable_ssh_password_auth >/dev/null 2>&1
@@ -298,6 +341,15 @@ rollback_ssh >> "$TEST_ROOT/failure-output" 2>&1 || true
 assert_eq "$(grep -c '^reload ' "$LOG")" 2 'persistent failure retried recovery'
 assert_eq "$(grep -c '已恢复 SSH drop-in' "$TEST_ROOT/failure-output")" 1 'persistent failure repeated restore'
 ok 'restore reload fails: terminal failure, no retries from main/EXIT'
+
+reset_config
+printf 'PasswordAuthentication yes\n' > "$SSH_DROPIN"
+cp "$SSH_DROPIN" "$TEST_ROOT/old-dropin"
+RELOAD_LOST_LISTENER=1
+if disable_ssh_password_auth <<< y > "$TEST_ROOT/failure-output" 2>&1; then fail 'active service without listener reported success'; fi
+cmp "$SSH_DROPIN" "$TEST_ROOT/old-dropin" || fail 'listener loss did not restore file'
+assert_eq "$SSH_ROLLBACK_FAILED" 1 'missing-listener recovery was reported successful'
+ok 'active service without SSH listener: failure and file rollback'
 
 reset_config
 printf 'PasswordAuthentication yes\n' > "$SSH_DROPIN_DIR/00-before.conf"
@@ -370,3 +422,4 @@ ok 'actual TERM invokes EXIT rollback'
 )
 ok 'base init: missing packages only, optional/default upgrade, cancel'
 printf '\nAll isolated tests passed. No daemon was started or host configuration modified.\n'
+TEST_COMPLETED=1
