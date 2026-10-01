@@ -6,7 +6,7 @@ set -Eeuo pipefail
 DEFAULT_SSH_PUBLIC_KEYS=(
     # "ssh-ed25519 AAAA... user@example"
 )
-VERSION="1.0.1"
+VERSION="1.0.2"
 BASIC_PACKAGES=(sudo curl ca-certificates git vim htop unzip)
 SSHD_CONFIG="/etc/ssh/sshd_config"
 SSH_DROPIN_DIR="/etc/ssh/sshd_config.d"
@@ -71,7 +71,7 @@ detect_os() {
     . /etc/os-release
     case "$ID:$VERSION_ID" in
         debian:12|debian:13|ubuntu:22.04|ubuntu:24.04|ubuntu:26.04) ;;
-        *) warn "仅支持 Debian 12/13、Ubuntu 22.04/24.04/26.04（当前 $ID $VERSION_ID）。"; return 1 ;;
+        *) warn "仅支持 Debian 12/13、Ubuntu 22.04/24.04/26.04（当前 $ID ${VERSION_ID}）。"; return 1 ;;
     esac
     case "$(uname -m)" in x86_64|aarch64|amd64|arm64) ;; *) warn '仅支持 amd64 / arm64。'; return 1 ;; esac
     command -v apt-get >/dev/null 2>&1 || return 1
@@ -371,14 +371,27 @@ check_supported_ssh_layout() {
     esac
 }
 check_ssh_reload_mode() {
-    local triggers sockets unit status
+    local triggers sockets unit status state enabled related=()
     triggers=$(systemctl show "$SSH_SERVICE" -p TriggeredBy --value) || return 1
     sockets=$(systemctl show "$SSH_SERVICE" -p Sockets --value) || return 1
-    if [[ $triggers == *'.socket'* || -n $sockets ]]; then
-        warn "SSH 服务与 socket activation 关联（TriggeredBy: ${triggers:-none}, Sockets: ${sockets:-none}）。"
-        warn '该模式的部分 OpenSSH 版本在 reload 后无法重新绑定端口；拒绝修改 SSH 配置。'
-        warn '请先人工检查 SSH 启动方式；工具不会停止 socket 或自动切换服务模式。'
-        return 1
+    if [[ -n $sockets ]]; then
+        warn "SSH 服务显式继承 socket（Sockets: ${sockets}），拒绝修改。"; return 1
+    fi
+    if [[ -n $triggers ]]; then
+        read -r -a related <<< "$triggers"
+        for unit in "${related[@]}"; do
+            [[ $unit == *.socket ]] || continue
+            state=$(systemctl show "$unit" -p ActiveState --value) || return 1
+            enabled=$(systemctl show "$unit" -p UnitFileState --value) || return 1
+            case "$state:$enabled" in
+                inactive:disabled|inactive:masked|failed:disabled|failed:masked) ;;
+                *)
+                    warn "SSH 关联 ${unit}（状态: ${state:-unknown}, 开机状态: ${enabled:-unknown}）。"
+                    warn 'socket activation 下部分 OpenSSH 版本 reload 会失败，拒绝修改 SSH 配置。'
+                    warn '请先人工检查 SSH 启动方式；工具不会停止 socket 或自动切换服务模式。'
+                    return 1 ;;
+            esac
+        done
     fi
     for unit in ssh.socket sshd.socket; do
         if systemctl is-active --quiet "$unit"; then
@@ -391,6 +404,22 @@ check_ssh_reload_mode() {
             esac
         fi
     done
+    check_sshd_listener_ownership
+}
+check_sshd_listener_ownership() {
+    local pid listeners line found=0
+    command -v ss >/dev/null || { warn '需要 ss（iproute2）核对 SSH 监听进程，拒绝修改。'; return 1; }
+    pid=$(systemctl show "$SSH_SERVICE" -p MainPID --value) || return 1
+    [[ $pid =~ ^[1-9][0-9]{0,9}$ ]] || { warn '无法确认 SSH 主进程 PID，拒绝修改。'; return 1; }
+    listeners=$(ss -H -lntp) || { warn '无法查询 TCP 监听进程，拒绝修改。'; return 1; }
+    while IFS= read -r line; do
+        [[ $line == *"pid=$pid,"* ]] || continue
+        if [[ $line == *'pid=1,'* ]]; then
+            warn 'SSH 监听 socket 仍由 systemd 共同持有，拒绝 reload。'; return 1
+        fi
+        found=1
+    done <<< "$listeners"
+    (( found )) || { warn 'SSH 主进程没有可确认的 TCP 监听 socket，拒绝修改。'; return 1; }
 }
 find_ssh_service() {
     local service start argv environment file token allowed environment_files tokens=()
@@ -442,6 +471,7 @@ check_ssh_service_health() {
     for _attempt in 1 2 3; do
         sleep 1
         systemctl is-active --quiet "$SSH_SERVICE" || return 1
+        check_sshd_listener_ownership || return 1
     done
 }
 rollback_ssh() {

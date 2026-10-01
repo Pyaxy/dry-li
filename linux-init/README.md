@@ -1,4 +1,4 @@
-# Linux Init Tool 1.0.1
+# Linux Init Tool 1.0.2
 
 可反复打开的 Debian / Ubuntu 初始化管理菜单。启动只检查状态；每项操作独立，选择并确认后才修改系统。
 首次显示和每次返回主菜单都会清屏，将标题放在终端顶部；操作结果保留到按回车返回。非交互输出和 dumb 终端不发送清屏控制序列。
@@ -48,7 +48,7 @@ DEFAULT_SSH_PUBLIC_KEYS=(
 | --- | --- | --- |
 | 1 创建用户 / 补 sudo | 默认用户名 `ppy`；新建 `/home/<user>`、`/bin/bash`，调用 `passwd`；默认授予 sudo | root 权限、有效用户名；同名 home 不能预先存在 |
 | 2 SSH Key 授权 | 选择普通登录用户；可选显示 root；预置所有 key 或手动粘贴 | 至少一个普通登录用户、`ssh-keygen`、真实 home、非链接 key 路径 |
-| 3 关闭 SSH 密码登录 | 开启公钥、禁止 SSH 密码/键盘交互和 root SSH | 至少一个满足全部条件的非 root 管理员，标准可验证 SSH 配置和活动 systemd 服务；确认默认 No |
+| 3 关闭 SSH 密码登录 | 开启公钥、禁止 SSH 密码/键盘交互和 root SSH | 至少一个满足全部条件的非 root 管理员，标准可验证 SSH 配置和活动 systemd 服务，`ss`（iproute2）可核对监听进程；确认默认 No |
 | 4 基础环境初始化 | 更新软件索引、安装缺少的基础包、设 UTC，之后可选 full-upgrade | apt 可用；开始默认 Yes，升级默认 Yes，均可拒绝 |
 | 5 查看状态 | 系统、登录用户、sudo 组、公钥数量、sshd 最终配置、包和管理员前置条件 | 只读查询；缺少 sshd 时显示 unknown |
 | 0 退出 | 关闭菜单 | 无 |
@@ -100,15 +100,16 @@ OpenSSH 多数配置采用 first obtained value wins，因此 `00` 通常会先�
 - 任意 `Match`、`AllowUsers`/`DenyUsers`、`AllowGroups`/`DenyGroups`。
 - 自定义 AuthorizedKeysFile、额外 AuthenticationMethods、ForceCommand、Chroot、吊销列表或公钥附加认证要求。
 - 无活动 `ssh.service` / `sshd.service`，不支持 reload，或服务启动参数/环境文件不能对应到默认 sshd 配置。
-- 服务关联 `TriggeredBy=*.socket` / `Sockets=`，或 `ssh.socket` / `sshd.socket` 正在运行。用户确认后和 reload 前再次核对，不自动停止 socket 或切换启动方式。
+- 显式 `Sockets=`、关联 socket 尚未停止并禁用/屏蔽，或 `ssh.socket` / `sshd.socket` 正在运行。用户确认后和 reload 前再次核对，不自动停止 socket 或切换启动方式。
+- `ss -H -lntp` 无法证明 SSH 主进程拥有 TCP 监听 socket，或该 socket 仍由 PID 1（systemd）共同持有。
 - 公钥算法不允许候选管理员的 key，或任何语法/最终值检查失败。
 
-支持可确认不关联 socket activation 的常规 `/usr/sbin/sshd -D [$SSHD_OPTS]` systemd 服务；只接受空 SSHD_OPTS 环境文件。
+支持可确认没有使用 socket activation 的常规 `/usr/sbin/sshd -D [$SSHD_OPTS]` systemd 服务；只接受空 SSHD_OPTS 环境文件。`TriggeredBy` 只是单元关联：关联 socket 已停止并禁用/屏蔽、且 SSH 主进程独立持有监听端口时可以继续，不因残留关联元数据一律拒绝。
 部分发行版/模板的 socket activation 存在 SIGHUP 后重新绑定失败的问题，语法通过不能证明 reload 安全，因此保守拒绝该模式；参见 [Debian #1128329](https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1128329)。
 非 systemd LXC 仍可使用用户、公钥、基础初始化和查看状态，但菜单 3 会拒绝执行。不会猜测 reload 命令。
 
 每次真正改 SSH 前，在 `/var/backups/linux-init/ssh-<UTC时间>-<随机后缀>/` 保存主配置和原托管 drop-in（若存在），并记录原文件是否存在。
-流程：原配置 `sshd -t` → 备份 → 原子替换 drop-in → `sshd -t` → 全局 `sshd -T` 和 root/候选用户 `sshd -T -C` → 四项及 key 可用性正确 → reload → 连续三次、间隔一秒核对活动服务，最终值再次校验。
+流程：原配置 `sshd -t` → 备份 → 原子替换 drop-in → `sshd -t` → 全局 `sshd -T` 和 root/候选用户 `sshd -T -C` → 四项及 key 可用性正确 → reload → 连续三次、间隔一秒核对活动服务及监听进程，最终值再次校验。
 语法/最终值失败会恢复且不 reload；reload 或后续检查失败会恢复原配置。仅服务仍在运行时尝试 reload 恢复后的配置，并再次等待验证。
 若监听进程已退出，明确报告“配置已恢复，但服务已停止/失败”，不会对已退出的服务反复 reload。恢复失败是事务的终止状态，main/EXIT 不重复恢复或重复刷屏，工具不自动 start/restart。
 退出、INT、TERM、HUP 时会回滚尚未完成的事务；不会主动 restart SSH 或终止当前连接。
@@ -142,6 +143,39 @@ systemctl status ssh.service ssh.socket --no-pager -l
 
 启动后用新终端验证登录。如果启动仍失败，读取 `journalctl -u ssh.service -n 60 --no-pager`、`ss -lntp` 和 `systemctl cat ssh.service ssh.socket` 排查；不要继续发送 HUP，也不要盲目停止/禁用 socket。
 服务停止时 systemd 可能清理运行目录，因此目录缺失不一定是最初失败的原因；须以完整日志确认。
+
+### 人工切换为常规服务模式
+
+只适用于已经核对单元定义的机器：`ssh.socket` 使用 `Accept=no`、触发 `ssh.service`，服务 `KillMode=process`、没有要求 socket 的自定义依赖。保留当前 SSH 会话，并确保有 Console 可恢复。
+先检查 `/usr/sbin/sshd -T` 的 `port` / `listenaddress` 是否仍为当前使用的端口和期望地址；socket 模式的 ListenStream 与 sshd 配置不一定相同，不能盲目切换。
+
+```bash
+/usr/sbin/sshd -T | grep -E '^(port|listenaddress) '
+```
+
+确认端口/地址正确后，以 root 执行：
+
+```bash
+install -d -o root -g root -m 0755 /run/sshd
+/usr/sbin/sshd -t &&
+    systemctl disable --now ssh.socket &&
+    systemctl enable ssh.service &&
+    systemctl restart ssh.service
+systemctl status ssh.service ssh.socket --no-pager -l
+ss -lntp
+```
+
+这是人工迁移启动模式所需的一次 restart，工具的加固流程仍只使用 reload。`KillMode=process` 表示停止服务时只向主进程发送停止信号，通常保留已建立的 SSH 会话，但必须在新终端重新验证登录。
+预期 socket 为 inactive/disabled、服务为 active/running、SSH 端口由 sshd 持有。验证后再用菜单 3 加固。
+若迁移失败且需要回到原来已启用 socket 的模式，在 Console/保留的 root 会话执行下列恢复步骤，再用新终端验证：
+
+```bash
+systemctl stop ssh.service &&
+    systemctl enable --now ssh.socket &&
+    systemctl start ssh.service
+```
+
+这些步骤只迁移启动方式，不修改认证配置或监听配置；不适用于未知 KillMode、自定义依赖或自定义 socket 单元的服务器。
 
 ## 基础环境与兼容范围
 
