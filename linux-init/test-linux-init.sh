@@ -35,6 +35,13 @@ RELOAD_FAIL=0
 SYNTAX_FAIL=0
 SUDO_POLICY_OK=yes
 FAKE_ENVIRONMENT_FILES=''
+FAKE_TRIGGERED_BY=''
+FAKE_SOCKETS=''
+FAKE_SOCKET_ACTIVE=no
+FAKE_SERVICE_ACTIVE=yes
+RELOAD_EXIT=0
+RELOAD_PERSISTENT_FAILURE=0
+RELOAD_DELAYED_EXIT=0
 
 # No actual user, group, package, ownership or service mutations are permitted.
 getent() {
@@ -75,10 +82,18 @@ stat() {
 }
 systemctl() {
     case "$1" in
-        is-active) return 0 ;;
+        is-active) case "${!#}" in
+            *.socket) [[ $FAKE_SOCKET_ACTIVE != yes ]] || return 0; return 3 ;;
+            *.service) [[ $FAKE_SERVICE_ACTIVE != yes ]] || return 0; return 3 ;;
+            *) return 4 ;;
+        esac ;;
         reload) printf 'reload %s\n' "$2" >> "$LOG"
+                if (( RELOAD_EXIT )); then FAKE_SERVICE_ACTIVE=no; return 1; fi
+                if (( RELOAD_PERSISTENT_FAILURE )); then return 1; fi
                 if (( RELOAD_FAIL )); then RELOAD_FAIL=0; return 1; fi ;;
         show) case "$*" in
+            *TriggeredBy*) printf '%s\n' "$FAKE_TRIGGERED_BY" ;;
+            *Sockets*) printf '%s\n' "$FAKE_SOCKETS" ;;
             *ExecStart*) printf '{ path=/usr/sbin/sshd ; argv[]=/usr/sbin/sshd -D $SSHD_OPTS ; ignore_errors=no ; }\n' ;;
             *EnvironmentFiles*) printf '%s\n' "$FAKE_ENVIRONMENT_FILES" ;;
             *Environment*) printf '\n' ;;
@@ -88,9 +103,14 @@ systemctl() {
         *) printf 'Unexpected service command!\n' >&2; return 1 ;;
     esac
 }
+sleep() {
+    # Simulate a daemon failing after systemctl reload already returned success.
+    if (( RELOAD_DELAYED_EXIT )); then FAKE_SERVICE_ACTIVE=no; fi
+} # No wall-clock waits in mocked service-health sampling.
 # Count validation failures without touching the actual daemon.
 real_sshd=$SSHD
 sshd_test() {
+    if [[ $1 == -t && $FAKE_SERVICE_ACTIVE == no ]]; then printf 'Missing privilege separation directory: /run/sshd\n' >&2; return 1; fi
     if [[ $1 == -t && -f $SSH_DROPIN ]] && grep -q 'PasswordAuthentication no' "$SSH_DROPIN" && (( SYNTAX_FAIL )); then return 1; fi
     "$real_sshd" "$@"
 }
@@ -104,7 +124,9 @@ reset_config() {
     printf 'Include %s/*.conf\nHostKey %s/host\nPidFile %s/pid\nUsePAM no\n' "$SSH_DROPIN_DIR" "$TEST_ROOT" "$TEST_ROOT" > "$SSHD_CONFIG"
     printf 'PasswordAuthentication yes\n' > "$SSH_DROPIN_DIR/50-cloud-init.conf"
     : > "$LOG"
-    SSH_TRANSACTION=0; SSH_RELOAD_ATTEMPTED=0; SYNTAX_FAIL=0; RELOAD_FAIL=0
+    SSH_TRANSACTION=0; SSH_RELOAD_ATTEMPTED=0; SSH_ROLLBACK_FAILED=0; SYNTAX_FAIL=0; RELOAD_FAIL=0
+    RELOAD_EXIT=0; RELOAD_PERSISTENT_FAILURE=0; RELOAD_DELAYED_EXIT=0
+    FAKE_TRIGGERED_BY=''; FAKE_SOCKETS=''; FAKE_SOCKET_ACTIVE=no; FAKE_SERVICE_ACTIVE=yes
 }
 set_users() {
     printf 'root:x:0:0:root:%s:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\nppy:x:1000:1000::%s:/bin/bash\nadmin:x:1001:1001::%s:/bin/bash\nservice:x:1002:1002::/srv/service:/bin/false\n' "$TEST_ROOT/root" "$TEST_ROOT/home/ppy" "$TEST_ROOT/home/admin" > "$PASSWD_FIXTURE"
@@ -197,6 +219,26 @@ if find_ssh_service; then fail 'custom service options accepted'; fi
 rm "${SSH_ENV_FILES[0]}"
 ok 'configuration precedence, Match and service-option refusal'
 
+for socket_case in triggered active explicit; do
+    reset_config
+    case "$socket_case" in
+        triggered) FAKE_TRIGGERED_BY=ssh.socket ;;
+        active) FAKE_SOCKET_ACTIVE=yes ;;
+        explicit) FAKE_SOCKETS=custom-ssh.socket ;;
+    esac
+    disable_ssh_password_auth <<< y >/dev/null 2>&1
+    [[ ! -f $SSH_DROPIN && ! -s $LOG ]] || fail "socket case $socket_case wrote or reloaded"
+done
+ok 'socket activation: TriggeredBy, active socket and Sockets refuse before writes'
+
+reset_config
+(
+    confirm() { FAKE_SOCKET_ACTIVE=yes; return 0; }
+    disable_ssh_password_auth >/dev/null 2>&1
+)
+[[ ! -f $SSH_DROPIN && ! -s $LOG ]] || fail 'socket activated during confirmation was not caught'
+ok 'socket activated during operator verification: recheck before writes'
+
 reset_config
 SUDO_MEMBER=no
 disable_ssh_password_auth >/dev/null
@@ -230,6 +272,32 @@ if disable_ssh_password_auth <<< y >/dev/null 2>&1; then fail 'reload failure re
 cmp "$SSH_DROPIN" "$TEST_ROOT/old-dropin" || fail 'reload failure did not restore existing drop-in'
 assert_eq "$(grep -c '^reload ' "$LOG")" 2 'failed reload followed by restore reload'
 ok 'reload failure: restore prior content and reload restored config'
+
+for exit_case in immediate delayed; do
+    reset_config
+    printf 'PasswordAuthentication yes\n' > "$SSH_DROPIN"
+    cp "$SSH_DROPIN" "$TEST_ROOT/old-dropin"
+    case "$exit_case" in immediate) RELOAD_EXIT=1 ;; delayed) RELOAD_DELAYED_EXIT=1 ;; esac
+    if disable_ssh_password_auth <<< y > "$TEST_ROOT/failure-output" 2>&1; then fail 'dead daemon reported success'; fi
+    # main and EXIT both call rollback again, but recovery must not loop.
+    rollback_ssh >> "$TEST_ROOT/failure-output" 2>&1 || true
+    rollback_ssh >> "$TEST_ROOT/failure-output" 2>&1 || true
+    cmp "$SSH_DROPIN" "$TEST_ROOT/old-dropin" || fail 'dead daemon did not restore file'
+    assert_eq "$(grep -c '^reload ' "$LOG")" 1 'dead daemon received another reload'
+    assert_eq "$(grep -c '已恢复 SSH drop-in' "$TEST_ROOT/failure-output")" 1 'duplicate restore warning'
+    if grep -q 'Missing privilege separation directory' "$TEST_ROOT/failure-output"; then fail 'validated stopped daemon with missing runtime dir'; fi
+    assert_eq "$SSH_ROLLBACK_FAILED" 1 'service recovery failure flag missing'
+done
+ok 'daemon exits on/after reload: restore once, no inactive reload or repeated rollback'
+
+reset_config
+RELOAD_PERSISTENT_FAILURE=1
+if disable_ssh_password_auth <<< y > "$TEST_ROOT/failure-output" 2>&1; then fail 'persistent reload failure reported success'; fi
+rollback_ssh >> "$TEST_ROOT/failure-output" 2>&1 || true
+rollback_ssh >> "$TEST_ROOT/failure-output" 2>&1 || true
+assert_eq "$(grep -c '^reload ' "$LOG")" 2 'persistent failure retried recovery'
+assert_eq "$(grep -c '已恢复 SSH drop-in' "$TEST_ROOT/failure-output")" 1 'persistent failure repeated restore'
+ok 'restore reload fails: terminal failure, no retries from main/EXIT'
 
 reset_config
 printf 'PasswordAuthentication yes\n' > "$SSH_DROPIN_DIR/00-before.conf"

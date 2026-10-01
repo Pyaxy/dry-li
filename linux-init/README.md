@@ -1,4 +1,4 @@
-# Linux Init Tool 1.0.0
+# Linux Init Tool 1.0.1
 
 可反复打开的 Debian / Ubuntu 初始化管理菜单。启动只检查状态；每项操作独立，选择并确认后才修改系统。
 首次显示和每次返回主菜单都会清屏，将标题放在终端顶部；操作结果保留到按回车返回。非交互输出和 dumb 终端不发送清屏控制序列。
@@ -100,14 +100,17 @@ OpenSSH 多数配置采用 first obtained value wins，因此 `00` 通常会先�
 - 任意 `Match`、`AllowUsers`/`DenyUsers`、`AllowGroups`/`DenyGroups`。
 - 自定义 AuthorizedKeysFile、额外 AuthenticationMethods、ForceCommand、Chroot、吊销列表或公钥附加认证要求。
 - 无活动 `ssh.service` / `sshd.service`，不支持 reload，或服务启动参数/环境文件不能对应到默认 sshd 配置。
+- 服务关联 `TriggeredBy=*.socket` / `Sockets=`，或 `ssh.socket` / `sshd.socket` 正在运行。用户确认后和 reload 前再次核对，不自动停止 socket 或切换启动方式。
 - 公钥算法不允许候选管理员的 key，或任何语法/最终值检查失败。
 
-支持常规 `/usr/sbin/sshd -D [$SSHD_OPTS]` systemd 服务；只接受空 SSHD_OPTS 环境文件。
+支持可确认不关联 socket activation 的常规 `/usr/sbin/sshd -D [$SSHD_OPTS]` systemd 服务；只接受空 SSHD_OPTS 环境文件。
+部分发行版/模板的 socket activation 存在 SIGHUP 后重新绑定失败的问题，语法通过不能证明 reload 安全，因此保守拒绝该模式；参见 [Debian #1128329](https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1128329)。
 非 systemd LXC 仍可使用用户、公钥、基础初始化和查看状态，但菜单 3 会拒绝执行。不会猜测 reload 命令。
 
 每次真正改 SSH 前，在 `/var/backups/linux-init/ssh-<UTC时间>-<随机后缀>/` 保存主配置和原托管 drop-in（若存在），并记录原文件是否存在。
-流程：原配置 `sshd -t` → 备份 → 原子替换 drop-in → `sshd -t` → 全局 `sshd -T` 和 root/候选用户 `sshd -T -C` → 四项及 key 可用性正确 → reload → 活动服务和最终值再次校验。
-语法/最终值失败会恢复且不 reload；reload 或后续检查失败会恢复并 reload 原配置。
+流程：原配置 `sshd -t` → 备份 → 原子替换 drop-in → `sshd -t` → 全局 `sshd -T` 和 root/候选用户 `sshd -T -C` → 四项及 key 可用性正确 → reload → 连续三次、间隔一秒核对活动服务，最终值再次校验。
+语法/最终值失败会恢复且不 reload；reload 或后续检查失败会恢复原配置。仅服务仍在运行时尝试 reload 恢复后的配置，并再次等待验证。
+若监听进程已退出，明确报告“配置已恢复，但服务已停止/失败”，不会对已退出的服务反复 reload。恢复失败是事务的终止状态，main/EXIT 不重复恢复或重复刷屏，工具不自动 start/restart。
 退出、INT、TERM、HUP 时会回滚尚未完成的事务；不会主动 restart SSH 或终止当前连接。
 
 `sshd -T` 是磁盘配置经 OpenSSH 解析后的值，不是运行中进程的内存快照；服务检查和 reload 之后的真实新连接验证仍必需。
@@ -128,6 +131,17 @@ fi
 
 不用把备份主配置写回，因为工具从未修改它。断电、SIGKILL 无法触发 Bash trap，仍须依靠保留的会话/Console 和备份人工恢复。
 自动回滚若恢复文件或 reload 失败，会明确提示，并停止菜单；不要关闭当前连接。
+
+如果 reload 后服务已经 failed，并出现 `Missing privilege separation directory: /run/sshd`，先保留当前 root 会话或打开 Console。下列步骤仅供人工恢复已停止的服务，不应作为再次执行加固的前置脚本：
+
+```bash
+install -d -o root -g root -m 0755 /run/sshd
+/usr/sbin/sshd -t && systemctl reset-failed ssh.service && systemctl start ssh.service
+systemctl status ssh.service ssh.socket --no-pager -l
+```
+
+启动后用新终端验证登录。如果启动仍失败，读取 `journalctl -u ssh.service -n 60 --no-pager`、`ss -lntp` 和 `systemctl cat ssh.service ssh.socket` 排查；不要继续发送 HUP，也不要盲目停止/禁用 socket。
+服务停止时 systemd 可能清理运行目录，因此目录缺失不一定是最初失败的原因；须以完整日志确认。
 
 ## 基础环境与兼容范围
 
@@ -153,7 +167,7 @@ sh build-pages.sh
 
 隔离测试只 source 函数，使用临时用户/配置数据和模拟管理命令。
 公钥校验及 `sshd -t/-T/-C` 使用真实 OpenSSH，仅读取临时配置/host key，不启动 daemon，不修改宿主机 SSH。
-覆盖 root-only、用户筛选、已有用户补 sudo、key 去重/损坏数据/权限/链接、锁定/到期/sudo 策略、Include/cloud-init 冲突、Match/服务参数拒绝、公钥算法拒绝、语法失败、reload 失败、TERM 回滚、process-substitution 重建，以及基础安装/升级确认。
+覆盖 root-only、用户筛选、已有用户补 sudo、key 去重/损坏数据/权限/链接、锁定/到期/sudo 策略、Include/cloud-init 冲突、Match/服务参数拒绝、公钥算法拒绝、socket activation 拒绝、确认期间启动方式变化、语法失败、reload 失败/延迟退出/恢复失败去重、TERM 回滚、process-substitution 重建，以及基础安装/升级确认。
 测试脚本和 README 不在 dist 白名单内，Snell 脚本内容保持不变。
 
 当前已在本地 macOS 的 Bash 和 OpenSSH 上运行隔离测试及 ShellCheck；**未完成各 Debian/Ubuntu 版本/架构的真实 VM 安装、systemd reload 和新连接登录验收**。

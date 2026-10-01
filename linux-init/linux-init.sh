@@ -6,7 +6,7 @@ set -Eeuo pipefail
 DEFAULT_SSH_PUBLIC_KEYS=(
     # "ssh-ed25519 AAAA... user@example"
 )
-VERSION="1.0.0"
+VERSION="1.0.1"
 BASIC_PACKAGES=(sudo curl ca-certificates git vim htop unzip)
 SSHD_CONFIG="/etc/ssh/sshd_config"
 SSH_DROPIN_DIR="/etc/ssh/sshd_config.d"
@@ -20,6 +20,7 @@ SSH_CANDIDATE=""
 SSH_TRANSACTION=0
 SSH_PREVIOUS_EXISTS=0
 SSH_RELOAD_ATTEMPTED=0
+SSH_ROLLBACK_FAILED=0
 SSH_SERVICE=""
 SSHD=""
 OS_NAME="unknown"
@@ -44,7 +45,7 @@ write_elevated_script() {
     {
         printf '#!/usr/bin/env bash\nset -Eeuo pipefail\n'
         declare -p DEFAULT_SSH_PUBLIC_KEYS VERSION BASIC_PACKAGES SSHD_CONFIG SSH_DROPIN_DIR SSH_DROPIN SSH_ENV_FILES BACKUP_ROOT SSH_CONTEXT
-        declare -p WORK_DIR SSH_BACKUP SSH_CANDIDATE SSH_TRANSACTION SSH_PREVIOUS_EXISTS SSH_RELOAD_ATTEMPTED SSH_SERVICE SSHD OS_NAME UID_MIN UID_MAX COLOR RESET
+        declare -p WORK_DIR SSH_BACKUP SSH_CANDIDATE SSH_TRANSACTION SSH_PREVIOUS_EXISTS SSH_RELOAD_ATTEMPTED SSH_ROLLBACK_FAILED SSH_SERVICE SSHD OS_NAME UID_MIN UID_MAX COLOR RESET
         declare -f
         printf '\nmain "$@"\n'
     } > "$1"
@@ -369,6 +370,28 @@ check_supported_ssh_layout() {
         *) warn '存在额外公钥认证要求，需人工检查。'; return 1 ;;
     esac
 }
+check_ssh_reload_mode() {
+    local triggers sockets unit status
+    triggers=$(systemctl show "$SSH_SERVICE" -p TriggeredBy --value) || return 1
+    sockets=$(systemctl show "$SSH_SERVICE" -p Sockets --value) || return 1
+    if [[ $triggers == *'.socket'* || -n $sockets ]]; then
+        warn "SSH 服务与 socket activation 关联（TriggeredBy: ${triggers:-none}, Sockets: ${sockets:-none}）。"
+        warn '该模式的部分 OpenSSH 版本在 reload 后无法重新绑定端口；拒绝修改 SSH 配置。'
+        warn '请先人工检查 SSH 启动方式；工具不会停止 socket 或自动切换服务模式。'
+        return 1
+    fi
+    for unit in ssh.socket sshd.socket; do
+        if systemctl is-active --quiet "$unit"; then
+            warn "$unit 正在运行，无法确认 SSH reload 安全；拒绝修改。"; return 1
+        else
+            status=$?
+            case "$status" in
+                3|4) ;; # inactive or no such unit
+                *) warn "无法确认 $unit 状态，拒绝修改。"; return 1 ;;
+            esac
+        fi
+    done
+}
 find_ssh_service() {
     local service start argv environment file token allowed environment_files tokens=()
     command -v systemctl >/dev/null || { warn '无 systemd，SSH 加固仅支持可确认的 systemd reload。'; return 1; }
@@ -377,6 +400,7 @@ find_ssh_service() {
         if systemctl is-active --quiet "$service"; then SSH_SERVICE=$service; break; fi
     done
     [[ -n $SSH_SERVICE ]] || { warn '没有正在运行的 ssh.service / sshd.service。'; return 1; }
+    check_ssh_reload_mode || return 1
     start=$(systemctl show "$SSH_SERVICE" -p ExecStart --value) || return 1
     argv=${start#*argv[]=}; argv=${argv%% ;*}
     # systemd expands this literal variable at service start; do not expand it here.
@@ -412,24 +436,44 @@ report_ssh_conflicts() {
     warn '可能冲突的文件/指令（未 reload）：'
     grep -nEi '^[[:space:]]*(Include|Match|PubkeyAuthentication|PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|PermitRootLogin)' "$SSHD_CONFIG" "$SSH_DROPIN_DIR"/*.conf >&2 || true
 }
+check_ssh_service_health() {
+    local _attempt
+    # ExecReload can finish before sshd completes its SIGHUP re-exec.
+    for _attempt in 1 2 3; do
+        sleep 1
+        systemctl is-active --quiet "$SSH_SERVICE" || return 1
+    done
+}
 rollback_ssh() {
+    # Failure is terminal for this transaction. main/EXIT must not retry it.
+    (( SSH_ROLLBACK_FAILED == 0 )) || return 1
     (( SSH_TRANSACTION )) || return 0
     local restore
+    SSH_ROLLBACK_FAILED=1
     if (( SSH_PREVIOUS_EXISTS )); then
-        restore=$(mktemp "${SSH_DROPIN}.restore.XXXXXX") || return 1
-        cp -p -- "$SSH_BACKUP/00-key-only.conf" "$restore" && mv -f -- "$restore" "$SSH_DROPIN" || return 1
-    else
-        rm -f -- "$SSH_DROPIN" || return 1
-    fi
-    warn '已恢复 SSH drop-in。'
-    if (( SSH_RELOAD_ATTEMPTED )); then
-        if "$SSHD" -t -f "$SSHD_CONFIG" && systemctl reload "$SSH_SERVICE"; then
-            warn '已 reload 恢复后的 SSH 配置。'
-        else
-            warn "恢复配置已写回，但 reload 失败！保留当前会话，使用备份 $SSH_BACKUP 排查。"; return 1
+        restore=$(mktemp "${SSH_DROPIN}.restore.XXXXXX") || { warn "无法创建恢复文件，保留当前会话，备份: $SSH_BACKUP"; return 1; }
+        if ! { cp -p -- "$SSH_BACKUP/00-key-only.conf" "$restore" && mv -f -- "$restore" "$SSH_DROPIN"; }; then
+            rm -f -- "$restore"
+            warn "SSH drop-in 恢复失败，保留当前会话，备份: $SSH_BACKUP"; return 1
         fi
+    else
+        rm -f -- "$SSH_DROPIN" || { warn "SSH drop-in 恢复失败，备份: $SSH_BACKUP"; return 1; }
     fi
     SSH_TRANSACTION=0
+    warn '已恢复 SSH drop-in。'
+    if (( SSH_RELOAD_ATTEMPTED )); then
+        if ! systemctl is-active --quiet "$SSH_SERVICE"; then
+            warn "原配置已恢复，但 $SSH_SERVICE 已停止/失败；reload 无法启动已退出的服务。"
+            warn "请保留当前会话，用 Console 或当前 root 会话人工恢复服务。备份: $SSH_BACKUP"
+            return 1
+        fi
+        if "$SSHD" -t -f "$SSHD_CONFIG" && systemctl reload "$SSH_SERVICE" && check_ssh_service_health; then
+            warn '已 reload 恢复后的 SSH 配置。'
+        else
+            warn "恢复配置已写回，但服务恢复验证失败！保留当前会话，使用备份 $SSH_BACKUP 排查。"; return 1
+        fi
+    fi
+    SSH_ROLLBACK_FAILED=0
 }
 cleanup() {
     local status=$?
@@ -485,11 +529,13 @@ disable_ssh_password_auth() {
     confirm '已完成新终端验证，继续关闭 SSH 密码登录？ [y/N] ' n || return 0
     # Recheck account state immediately before the transaction.
     check_ssh_hardening_readiness || { warn '前置状态发生变化，取消。'; return 0; }
+    # The operator may have changed service state during new-terminal verification.
+    find_ssh_service || return 0
     [[ ! -L $SSH_DROPIN && ( ! -e $SSH_DROPIN || -f $SSH_DROPIN ) ]] || return 1
     mkdir -p -- "$BACKUP_ROOT" && chmod 700 "$BACKUP_ROOT" || return 1
     SSH_BACKUP=$(mktemp -d "$BACKUP_ROOT/ssh-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX") || return 1
     cp -p -- "$SSHD_CONFIG" "$SSH_BACKUP/sshd_config" || return 1
-    SSH_PREVIOUS_EXISTS=0; SSH_RELOAD_ATTEMPTED=0
+    SSH_PREVIOUS_EXISTS=0; SSH_RELOAD_ATTEMPTED=0; SSH_ROLLBACK_FAILED=0
     if [[ -e $SSH_DROPIN ]]; then
         cp -p -- "$SSH_DROPIN" "$SSH_BACKUP/00-key-only.conf" || return 1
         SSH_PREVIOUS_EXISTS=1
@@ -507,9 +553,10 @@ disable_ssh_password_auth() {
     SSH_CANDIDATE=''
     if ! "$SSHD" -t -f "$SSHD_CONFIG"; then rollback_ssh; return 1; fi
     if ! verify_key_only; then report_ssh_conflicts; rollback_ssh; return 1; fi
+    if ! check_ssh_reload_mode; then rollback_ssh; return 1; fi
     SSH_RELOAD_ATTEMPTED=1
     if ! systemctl reload "$SSH_SERVICE"; then rollback_ssh; return 1; fi
-    if ! systemctl is-active --quiet "$SSH_SERVICE" || ! verify_key_only; then rollback_ssh; return 1; fi
+    if ! check_ssh_service_health || ! verify_key_only; then rollback_ssh; return 1; fi
     SSH_TRANSACTION=0
     say "SSH 配置已生效。备份: $SSH_BACKUP"
     config=$(get_effective_sshd_config) || return 1
