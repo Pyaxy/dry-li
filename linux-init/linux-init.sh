@@ -6,7 +6,7 @@ set -Eeuo pipefail
 DEFAULT_SSH_PUBLIC_KEYS=(
     # "ssh-ed25519 AAAA... user@example"
 )
-VERSION="1.1.0"
+VERSION="1.2.0"
 BASIC_PACKAGES=(sudo curl ca-certificates git vim htop unzip)
 SSHD_CONFIG="/etc/ssh/sshd_config"
 SSH_DROPIN_DIR="/etc/ssh/sshd_config.d"
@@ -37,16 +37,86 @@ UID_MIN=1000
 UID_MAX=60000
 COLOR=""
 RESET=""
+GREEN=""
+YELLOW=""
+RED=""
+MUTED=""
+BOLD=""
+UI_WIDTH=60
+UI_HEIGHT=24
 
 say() { printf '%s\n' "$*"; }
-warn() { printf '提示: %s\n' "$*" >&2; }
-ask() { read -r -p "$1" "$2"; }
+# Presentation only: never add styling to machine-readable query functions.
+setup_ui() {
+    local colors columns lines
+    COLOR=''; RESET=''; GREEN=''; YELLOW=''; RED=''; MUTED=''; BOLD=''; UI_WIDTH=60; UI_HEIGHT=24
+    [[ -t 1 && -n ${TERM:-} && $TERM != dumb ]] || return 0
+    command -v tput >/dev/null || return 0
+    columns=$(tput cols 2>/dev/null) || columns=60
+    if [[ $columns =~ ^[0-9]{1,4}$ ]] && (( columns >= 20 && columns < 60 )); then UI_WIDTH=$columns; fi
+    lines=$(tput lines 2>/dev/null) || lines=24
+    if [[ $lines =~ ^[0-9]{1,4}$ ]] && (( lines > 0 )); then UI_HEIGHT=$lines; fi
+    [[ -z ${NO_COLOR+x} ]] || return 0
+    colors=$(tput colors 2>/dev/null) || return 0
+    [[ $colors =~ ^[0-9]{1,6}$ ]] && (( colors >= 8 )) || return 0
+    # Use the terminal's capabilities rather than assuming ANSI support.
+    RESET=$(tput sgr0 2>/dev/null) || { RESET=''; return 0; }
+    COLOR=$(tput setaf 6 2>/dev/null) || COLOR=''
+    GREEN=$(tput setaf 2 2>/dev/null) || GREEN=''
+    YELLOW=$(tput setaf 3 2>/dev/null) || YELLOW=''
+    RED=$(tput setaf 1 2>/dev/null) || RED=''
+    MUTED=$(tput dim 2>/dev/null) || MUTED=''
+    BOLD=$(tput bold 2>/dev/null) || BOLD=''
+}
+ui_text() {
+    local style=$1 reset=$RESET
+    shift
+    if [[ ! -t 1 ]]; then style=''; reset=''; fi
+    printf '%s%s%s\n' "$style" "$*" "$reset"
+}
+ui_notice() {
+    local label=$1 style=$2 reset=$RESET
+    shift 2
+    if [[ ! -t 2 ]]; then style=''; reset=''; fi
+    printf '%s[%s]%s %s\n' "$style" "$label" "$reset" "$*" >&2
+}
+warn() { ui_notice '提示' "$YELLOW" "$*"; }
+error() { ui_notice '错误' "$RED" "$*"; }
+restored() { ui_notice '恢复' "$GREEN" "$*"; }
+info() { ui_text "$COLOR" "[进行] $*"; }
+success() { ui_text "$GREEN" "[完成] $*"; }
+hint() { ui_text "$MUTED" "  $*"; }
+ui_rule() { printf '%*s\n' "$UI_WIDTH" '' | tr ' ' '-'; }
+ui_section() { say ''; ui_text "$BOLD$COLOR" "$1"; ui_rule; }
+ui_field() {
+    local label=$1 value=$2 tone=${3:-plain} style='' reset=$RESET
+    case "$tone" in good) style=$GREEN ;; caution) style=$YELLOW ;; bad) style=$RED ;; muted) style=$MUTED ;; esac
+    if [[ ! -t 1 ]]; then style=''; reset=''; fi
+    printf '  %s: %s%s%s\n' "$label" "$style" "$value" "$reset"
+}
+ui_option() {
+    local style="$BOLD$COLOR" reset=$RESET
+    if [[ ! -t 1 ]]; then style=''; reset=''; fi
+    printf '  %s[%s]%s %s\n' "$style" "$1" "$reset" "$2"
+    [[ -z ${3:-} ]] || hint "    $3"
+}
+ui_yes_no() {
+    if [[ $2 == yes ]]; then ui_field "$1" '已满足' good; else ui_field "$1" '未满足' caution; fi
+}
+ask() {
+    local style=$COLOR reset=$RESET
+    if [[ -t 0 ]]; then
+        if [[ ! -t 2 ]]; then style=''; reset=''; fi
+        printf '%s%s%s' "$style" "$1" "$reset" >&2
+    fi
+    read -r "$2"
+}
 confirm() {
     local answer
     ask "$1" answer || return 1
     case "${answer:-$2}" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
 }
-pause() { local answer; ask '按回车返回菜单…' answer || true; }
+pause() { local answer; say ''; ask '按 Enter 返回主页… ' answer || true; }
 
 write_elevated_script() {
     # Serialize the already parsed program, not the original stdin or /dev/fd pipe.
@@ -56,6 +126,9 @@ write_elevated_script() {
         declare -p DEFAULT_SSH_PUBLIC_KEYS VERSION BASIC_PACKAGES SSHD_CONFIG SSH_DROPIN_DIR SSH_DROPIN SSH_ENV_FILES BACKUP_ROOT SSH_CONTEXT
         declare -p WORK_DIR SSH_BACKUP SSH_CANDIDATE SSH_TRANSACTION SSH_PREVIOUS_EXISTS SSH_RELOAD_ATTEMPTED SSH_ROLLBACK_FAILED SSH_SERVICE SSHD OS_NAME UID_MIN UID_MAX COLOR RESET
         declare -p SSH_SOCKET SSH_RUNTIME_DIR SSH_MIGRATION_NEEDED SSH_MODE_CHANGED SSH_RUNTIME_STATE SSH_ORIGINAL_SERVICE_ACTIVE SSH_ORIGINAL_SERVICE_ENABLED SSH_ORIGINAL_SOCKET_ACTIVE SSH_ORIGINAL_SOCKET_ENABLED
+        declare -p GREEN YELLOW RED MUTED BOLD UI_WIDTH UI_HEIGHT
+        # sudo may filter this preference from the environment.
+        if [[ -n ${NO_COLOR+x} ]]; then declare -p NO_COLOR; fi
         declare -f
         printf '\nmain "$@"\n'
     } > "$1"
@@ -67,7 +140,7 @@ require_root() {
     staging=$(mktemp -d) || return 1
     chmod 700 "$staging" || { rm -rf -- "$staging"; return 1; }
     if ! write_elevated_script "$staging/init.sh"; then rm -rf -- "$staging"; return 1; fi
-    say '正在通过 sudo 获取管理权限…'
+    info '正在通过 sudo 获取管理权限…'
     sudo /bin/bash "$staging/init.sh" || status=$?
     rm -rf -- "$staging"
     exit "$status"
@@ -212,32 +285,34 @@ install_packages() {
 }
 grant_sudo() {
     local user=$1
-    if user_has_sudo "$user"; then say "$user 已属于 sudo 组。"; return 0; fi
+    if user_has_sudo "$user"; then success "$user 已属于 sudo 组，无需重复添加。"; return 0; fi
     install_packages sudo || return 1
     getent group sudo >/dev/null || { warn '缺少 sudo 组，请检查 sudo 安装。'; return 1; }
     usermod -aG sudo "$user" || return 1
-    say "$user 已加入 sudo 组；新登录后生效，sudo 使用该用户的 Linux 密码。"
+    success "$user 已加入 sudo 组。"
+    hint '重新登录后组权限生效；sudo 使用该用户的 Linux 密码。'
 }
 show_user() {
     local user=$1
-    say "User: $user"
-    say "Home: $(user_home "$user")"
-    say "Shell: $(getent passwd "$user" | cut -d: -f7)"
-    say "Sudo: $(sudo_label "$user")"
-    say "SSH keys: $(count_authorized_keys "$user")"
+    ui_field '用户' "$user"
+    ui_field 'Home' "$(user_home "$user")"
+    ui_field 'Shell' "$(getent passwd "$user" | cut -d: -f7)"
+    if user_has_sudo "$user"; then ui_field 'sudo 组' '已加入' good; else ui_field 'sudo 组' '未加入' caution; fi
+    ui_field '有效 SSH Key' "$(count_authorized_keys "$user")"
 }
 create_user() {
     local user choice
+    ui_section '创建用户 / sudo 权限'
     ask '请输入用户名 [ppy]: ' user || return 0
     user=${user:-ppy}
     [[ $user =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { warn '用户名须以小写字母/下划线开头，最多 32 位，只含小写字母、数字、_、-。'; return 0; }
     if user_exists "$user"; then
-        say "User $user already exists."
+        info "用户 $user 已存在。"
         show_user "$user"
         if ! list_login_users | grep -Fx -- "$user" >/dev/null; then
             warn '这是 root 或系统/不可登录用户，不提供 sudo 管理。'; return 0
         fi
-        say '1) 授予 sudo 权限'; say '2) 不修改'; say '0) 返回'
+        say ''; ui_option 1 '授予 sudo 权限'; ui_option 2 '保持不变'; ui_option 0 '返回主页'
         ask '请选择: ' choice || return 0
         [[ $choice != 1 ]] || grant_sudo "$user"
         return 0
@@ -245,13 +320,13 @@ create_user() {
     [[ ! -e /home/$user && ! -L /home/$user ]] || { warn '同名 home 路径已存在，拒绝使用。'; return 0; }
     install_packages sudo || return 1
     useradd -m -d "/home/$user" -s /bin/bash "$user" || return 1
-    say '请设置用户的 Linux 密码（供 sudo / Console 使用）：'
+    info '请设置 Linux 密码，用于 sudo / Console：'
     if ! passwd "$user"; then
         warn "密码未设置成功；用户已保留，请用 passwd $user 重试。SSH 加固会拒绝这个账号。"
         show_user "$user"; return 0
     fi
     if confirm '是否授予该用户 sudo 权限？ [Y/n] ' y; then grant_sudo "$user" || return 1; fi
-    say "User $user created successfully."
+    success "用户 $user 创建完成。"
     show_user "$user"
 }
 
@@ -263,8 +338,8 @@ select_key_user() {
     fi
     if confirm '显示 root 用户？ [y/N] ' n; then users+=(root); fi
     say '请选择要授权 SSH Key 的用户：'
-    for user in "${users[@]}"; do say "$i) $user"; i=$((i + 1)); done
-    say '0) 返回'
+    for user in "${users[@]}"; do ui_option "$i" "$user"; i=$((i + 1)); done
+    ui_option 0 '返回主页'
     ask '请选择: ' choice || return 1
     [[ $choice =~ ^[0-9]{1,4}$ ]] || return 1
     choice=$((10#$choice))
@@ -303,9 +378,10 @@ append_keys() {
 }
 authorize_ssh_key() {
     local choice key
+    ui_section 'SSH Key 授权'
     command -v ssh-keygen >/dev/null || { warn '需要 ssh-keygen（openssh-client）；请先安装。'; return 0; }
     select_key_user || return 0
-    say '1) 使用脚本预置 SSH Key'; say '2) 手动粘贴 SSH Public Key'; say '0) 返回'
+    say ''; ui_option 1 '使用脚本预置 SSH Key'; ui_option 2 '手动粘贴 SSH 公钥'; ui_option 0 '返回主页'
     ask '请选择: ' choice || return 0
     case "$choice" in
         1) (( ${#DEFAULT_SSH_PUBLIC_KEYS[@]} )) || { warn '尚未填写 DEFAULT_SSH_PUBLIC_KEYS。'; return 0; }
@@ -314,9 +390,9 @@ authorize_ssh_key() {
            append_keys "$SELECTED_USER" "$key" || return 1 ;;
         *) return 0 ;;
     esac
-    say "SSH Key authorization completed for $SELECTED_USER."
-    say "Authorized keys: $(count_authorized_keys "$SELECTED_USER")"
-    say "Sudo: $(sudo_label "$SELECTED_USER")"
+    success "已为 $SELECTED_USER 完成 SSH Key 授权。"
+    show_user "$SELECTED_USER"
+    hint '请另开终端验证公钥登录，保留当前会话。'
 }
 
 get_effective_sshd_config() {
@@ -325,7 +401,7 @@ get_effective_sshd_config() {
 }
 config_value() { printf '%s\n' "$1" | awk -v key="$2" '$1 == key {$1=""; sub(/^ /, ""); print; exit}'; }
 show_ssh_values() {
-    local config=$1 key label
+    local config=$1 key label value tone
     for key in pubkeyauthentication passwordauthentication kbdinteractiveauthentication permitrootlogin; do
         case "$key" in
             pubkeyauthentication) label=PubkeyAuthentication ;;
@@ -333,7 +409,10 @@ show_ssh_values() {
             kbdinteractiveauthentication) label=KbdInteractiveAuthentication ;;
             permitrootlogin) label=PermitRootLogin ;;
         esac
-        say "$label: $(config_value "$config" "$key")"
+        tone=caution
+        value=$(config_value "$config" "$key")
+        if [[ ( $key == pubkeyauthentication && $value == yes ) || ( $key != pubkeyauthentication && $value == no ) ]]; then tone=good; fi
+        ui_field "$label" "$value" "$tone"
     done
 }
 key_only_values() {
@@ -555,6 +634,7 @@ report_ssh_conflicts() {
 ssh_service_step() {
     local label=$1
     shift
+    info "$label"
     "$@" || { warn "SSH 服务操作失败: ${label}；这是服务/监听应用失败，不代表 sshd_config 语法错误。"; return 1; }
 }
 check_ssh_service_health() {
@@ -675,21 +755,21 @@ rollback_ssh() {
     local restore
     SSH_ROLLBACK_FAILED=1
     if (( SSH_PREVIOUS_EXISTS )); then
-        restore=$(mktemp "${SSH_DROPIN}.restore.XXXXXX") || { warn "无法创建恢复文件，保留当前会话，备份: $SSH_BACKUP"; return 1; }
+        restore=$(mktemp "${SSH_DROPIN}.restore.XXXXXX") || { error "无法创建恢复文件，保留当前会话，备份: $SSH_BACKUP"; return 1; }
         if ! { cp -p -- "$SSH_BACKUP/00-key-only.conf" "$restore" && mv -f -- "$restore" "$SSH_DROPIN"; }; then
             rm -f -- "$restore"
-            warn "SSH drop-in 恢复失败，保留当前会话，备份: $SSH_BACKUP"; return 1
+            error "SSH drop-in 恢复失败，保留当前会话，备份: $SSH_BACKUP"; return 1
         fi
     else
-        rm -f -- "$SSH_DROPIN" || { warn "SSH drop-in 恢复失败，备份: $SSH_BACKUP"; return 1; }
+        rm -f -- "$SSH_DROPIN" || { error "SSH drop-in 恢复失败，备份: $SSH_BACKUP"; return 1; }
     fi
     SSH_TRANSACTION=0
-    warn '已恢复 SSH drop-in。'
+    restored '已恢复 SSH drop-in。'
     if (( SSH_RELOAD_ATTEMPTED )); then
         if restore_ssh_runtime; then
-            warn '已恢复原 SSH 启动模式和 22 端口监听；请另开终端验证登录。'
+            restored '已恢复原 SSH 启动模式和 22 端口监听；请另开终端验证登录。'
         else
-            warn "配置已恢复，但 SSH 服务/监听恢复验证失败！不要关闭当前会话；请用 Console 或当前 root 会话排查。备份: $SSH_BACKUP"
+            error "配置已恢复，但 SSH 服务/监听恢复验证失败！不要关闭当前会话；请用 Console 或当前 root 会话排查。备份: $SSH_BACKUP"
             warn '请检查 systemctl status ssh.service ssh.socket、journalctl -u ssh.service 和 ss -lntp。'
             show_ssh_runtime_status >&2
             return 1
@@ -729,35 +809,38 @@ verify_key_only() {
 }
 disable_ssh_password_auth() {
     local config user planned_state
+    ui_section 'SSH 登录加固'
     # Syntax is the first gate, before account checks, backups or unit changes.
     if [[ -z $SSHD ]] || ! "$SSHD" -t -f "$SSHD_CONFIG"; then
         warn '原始 SSH 配置验证失败，未修改配置或服务。'; return 1
     fi
     config=$(get_effective_sshd_config) || return 0
     if [[ $(config_value "$config" passwordauthentication) == no ]]; then
-        say 'SSH password authentication is already disabled.'
+        success 'SSH 密码登录已关闭。'
         show_ssh_values "$config"
         if key_only_values "$config" 2>/dev/null && find_ssh_service && (( ! SSH_MIGRATION_NEEDED )); then
-            say '四项设置及服务监听均已满足；未重复修改。'; return 0
+            success '四项设置及服务监听均已满足，无需重复修改。'; return 0
         fi
         warn '认证目标或 SSH 启动模式仍需处理，将按完整前置检查执行。'
     fi
     if ! check_ssh_hardening_readiness; then
-        warn 'Cannot disable SSH password authentication.'
+        warn '当前不满足关闭 SSH 密码登录的条件。'
         warn '没有非 root 管理员同时满足：sudo、未过期的本地密码、安全权限、公钥。'
         say '请先创建用户、设置 Linux 密码、授予 sudo 并授权 SSH Key。'; return 0
     fi
     check_supported_ssh_layout && find_ssh_service || return 0
     planned_state=$SSH_RUNTIME_STATE
+    ui_section '操作前确认'
     say '以下普通管理员已配置公钥：'
-    for user in "${READY_USERS[@]}"; do say "- $user (sudo: yes, keys: $(count_authorized_keys "$user"))"; done
-    say '此操作禁止 root SSH、SSH 密码和键盘交互认证，保留 Linux 本地密码。'
+    for user in "${READY_USERS[@]}"; do ui_field "$user" "sudo 已就绪 / $(count_authorized_keys "$user") 个有效公钥" good; done
+    warn '此操作将关闭 root SSH、SSH 密码及键盘交互认证。'
+    hint '保留 Linux 本地密码、Console 登录及 sudo 密码认证。'
     if (( SSH_MIGRATION_NEEDED )); then
         say "检测到 SSH socket 已启用/运行，将停止并禁用 ${SSH_SOCKET}，切换到 ${SSH_SERVICE}（仅停止监听主进程，保留已有会话）。"
     else
         say "当前为传统服务模式，将校验后 reload ${SSH_SERVICE}。"
     fi
-    say '请先在新终端实际验证普通用户公钥登录和 sudo，再返回此处确认。'
+    hint '请先在新终端验证普通用户公钥登录及 sudo，再返回这里确认。'
     confirm '已完成新终端验证，继续关闭 SSH 密码登录？ [y/N] ' n || return 0
     # Recheck account state immediately before the transaction.
     check_ssh_hardening_readiness || { warn '前置状态发生变化，取消。'; return 0; }
@@ -801,12 +884,13 @@ disable_ssh_password_auth() {
     if ! apply_ssh_configuration || ! verify_key_only; then rollback_ssh; return 1; fi
     SSH_TRANSACTION=0
     SSH_MODE_CHANGED=0
-    say "SSH 配置已生效。备份: $SSH_BACKUP"
+    success 'SSH 配置已生效。'
+    ui_field '备份目录' "$SSH_BACKUP"
     config=$(get_effective_sshd_config) || return 1
     show_ssh_values "$config"
     show_ssh_runtime_status
-    say 'Current SSH session has not been terminated.'
-    say 'Before closing it, open a NEW terminal and verify key-based login works.'
+    hint '当前 SSH 会话已保留。'
+    warn '关闭当前会话前，请另开新终端验证公钥登录和 sudo。'
 }
 
 get_timezone() {
@@ -829,23 +913,34 @@ configure_timezone() {
 }
 basic_init() {
     local package missing=()
-    say '将执行：apt update、安装缺少的基础包、设置 UTC；之后可选 full-upgrade。'
-    say "基础包: ${BASIC_PACKAGES[*]}"
+    ui_section '基础环境初始化'
+    say '将更新软件索引、补齐基础包并设置 UTC，之后可选系统升级。'
+    ui_field '基础包' "${BASIC_PACKAGES[*]}"
     confirm '继续？ [Y/n] ' y || return 0
+    info '1/3 更新软件索引'
     apt-get update || return 1
     for package in "${BASIC_PACKAGES[@]}"; do
         if ! package_installed "$package"; then missing+=("$package"); fi
     done
-    if (( ${#missing[@]} )); then apt-get install -y "${missing[@]}" || return 1; fi
+    info '2/3 检查基础软件包'
+    if (( ${#missing[@]} )); then
+        ui_field '待安装' "${missing[*]}"
+        apt-get install -y "${missing[@]}" || return 1
+    else success '基础软件包已齐全。'
+    fi
+    info '3/3 设置系统时区为 UTC'
     configure_timezone || return 1
-    if confirm 'Run full system upgrade? [Y/n] ' y; then
-        say '升级可能触发发行版包维护脚本，请留意 apt 输出；工具不会主动重启。'
+    say ''
+    if confirm '是否执行完整系统升级？ [Y/n] ' y; then
+        warn '升级可能触发发行版包维护脚本，请留意软件包提示。'
+        info '正在升级系统软件包；工具不会主动重启。'
         apt-get full-upgrade -y || return 1
     fi
-    if [[ -e /var/run/reboot-required ]]; then say 'Reboot required.'; else say 'Reboot not required.'; fi
+    success '基础环境初始化完成。'
+    if [[ -e /var/run/reboot-required ]]; then warn '系统检测到重启标记，请安排手动重启。'; else hint '未检测到系统重启标记。'; fi
 }
 show_ssh_runtime_status() {
-    local unit service='' socket='' service_state=unknown socket_state=unknown enabled=unknown listeners owner=none mode=unknown
+    local unit service='' socket='' service_state=unknown socket_state=unknown enabled=unknown listeners owner=none mode=unknown tone
     if command -v systemctl >/dev/null; then
         for unit in ssh.service sshd.service; do
             if [[ $(systemctl show "$unit" -p LoadState --value 2>/dev/null) == loaded ]]; then service=$unit; break; fi
@@ -873,63 +968,95 @@ show_ssh_runtime_status() {
         fi
     else owner=unknown
     fi
-    say "Mode: $mode"; say "Service: $service_state${service:+ ($service)}"
-    say "Socket: $socket_state${socket:+ ($socket)}, enabled: $enabled"
-    say "Port 22 listener: $owner"
+    tone=caution; [[ $mode != service ]] || tone=good
+    ui_field 'Mode' "$mode" "$tone"
+    tone=caution
+    case "$service_state" in active) tone=good ;; failed) tone=bad ;; esac
+    ui_field 'Service' "$service_state${service:+ ($service)}" "$tone"
+    tone=caution
+    case "$socket_state:$enabled" in inactive:disabled|inactive:masked|inactive:masked-runtime|not-found:not-found) tone=muted ;; esac
+    ui_field 'Socket' "$socket_state${socket:+ ($socket)}, enabled: $enabled" "$tone"
+    tone=caution
+    case "$owner" in sshd) tone=good ;; none) tone=bad ;; esac
+    ui_field 'Port 22 listener' "$owner" "$tone"
 }
 show_status() {
-    local user config package admin=no key=no safe=no
-    say ''; say 'System'; say '------'
-    say "OS: $OS_NAME"; say "Kernel: $(uname -r)"
-    say "Architecture: $(dpkg --print-architecture)"; say "Timezone: $(get_timezone)"
-    say ''; say 'Users (普通登录用户，按 login.defs UID 范围和登录 shell 筛选)'; say '-----'
-    say "root    sudo=n/a   ssh_keys=$(count_authorized_keys root)"
+    local user config package admin=no key=no safe=no count sudo_state
+    ui_section '系统信息'
+    ui_field '系统' "$OS_NAME"; ui_field '内核' "$(uname -r)"
+    ui_field '架构' "$(dpkg --print-architecture)"; ui_field '时区' "$(get_timezone)"
+    ui_section '用户与 SSH Key'
+    hint '普通登录用户按 login.defs UID 范围和登录 shell 筛选。'
+    ui_field 'root' "sudo 不适用 / $(count_authorized_keys root) 个有效公钥"
     while IFS= read -r user; do
-        say "$user    sudo=$(sudo_label "$user")   ssh_keys=$(count_authorized_keys "$user")"
-        if user_has_sudo "$user"; then admin=yes; fi
-        if (( $(count_authorized_keys "$user") > 0 )); then key=yes; fi
+        sudo_state='未加入'
+        if user_has_sudo "$user"; then admin=yes; sudo_state='已加入'; fi
+        count=$(count_authorized_keys "$user")
+        ui_field "$user" "sudo ${sudo_state} / $count 个有效公钥"
+        if (( count > 0 )); then key=yes; fi
     done < <(list_login_users)
-    say ''; say 'SSH (磁盘配置经 sshd -T 解析；不等于实际登录验证)'; say '---'
+    ui_section 'SSH 工作模式与登录策略'
     show_ssh_runtime_status
-    if config=$(get_effective_sshd_config); then show_ssh_values "$config"; else say 'unknown'; fi
-    say ''; say 'Packages'; say '--------'
+    say ''
+    if config=$(get_effective_sshd_config); then show_ssh_values "$config"; else ui_field '认证配置' 'unknown' caution; fi
+    hint '认证值来自磁盘配置（sshd -T），不能代替新连接验证。'
+    ui_section '基础软件包'
     for package in "${BASIC_PACKAGES[@]}"; do
-        if package_installed "$package"; then say "$package: installed"; else say "$package: missing"; fi
+        if package_installed "$package"; then ui_field "$package" '已安装' good; else ui_field "$package" '未安装' caution; fi
     done
     if check_ssh_hardening_readiness; then safe=yes; fi
-    say ''; say 'Initialization readiness'; say '------------------------'
-    say "Non-root sudo member: $admin"; say "SSH key configured: $key"
-    say "Administrator prerequisites: $safe"
-    say 'SSH 加固还需检查配置结构、服务、sshd -t/-T，并确认新终端实际登录。'
+    ui_section 'SSH 加固前置条件'
+    ui_yes_no '非 root sudo 用户' "$admin"; ui_yes_no '普通用户已配置公钥' "$key"
+    ui_yes_no '管理员完整前置条件' "$safe"
+    hint '加固还需检查 SSH 配置、服务和监听，并确认新终端实际登录。'
 }
 clear_menu_screen() {
-    if [[ -t 1 && ${TERM:-dumb} != dumb ]]; then
-        printf '\033[2J\033[H'
+    local home erase
+    if [[ -t 1 && -n ${TERM:-} && $TERM != dumb ]] && command -v tput >/dev/null; then
+        # Clear the visible page while preserving scrollback for past results.
+        home=$(tput cup 0 0 2>/dev/null) || return 0
+        erase=$(tput ed 2>/dev/null) || return 0
+        printf '%s%s' "$home" "$erase"
     fi
 }
 show_menu() {
     local config password=unknown rootlogin=unknown users key_hint='' hard_hint
+    setup_ui
     clear_menu_screen
     users=$(list_login_users)
-    [[ -n $users ]] || key_hint=' [需要先创建普通用户]'
-    hard_hint=' [需要 sudo + 有效公钥 + 可用本地密码]'
-    if check_ssh_hardening_readiness; then hard_hint=' [前置用户条件满足，仍需验证 SSH]'; fi
+    if [[ -n $users ]]; then key_hint='为现有用户追加公钥，保留已有 Key'; else key_hint='需要先创建普通登录用户'; fi
+    hard_hint='需要 sudo、有效公钥及可用的本地密码'
+    if check_ssh_hardening_readiness; then hard_hint='管理员条件已满足；请先验证新终端登录'; fi
     if config=$(get_effective_sshd_config 2>/dev/null); then
         password=$(config_value "$config" passwordauthentication)
         rootlogin=$(config_value "$config" permitrootlogin)
     fi
-    printf '%s╭──────────────────────────────╮\n│        Linux Init Tool       │\n╰──────────────────────────────╯%s\n' "$COLOR" "$RESET"
-    say "System: $OS_NAME | Host: $(hostname)"
-    say "Current user: $(id -un) | Timezone: $(get_timezone)"
-    say "SSH password login: $password | Root SSH: $rootlogin"
-    say '1) 创建用户 / 补 sudo 权限'
-    say "2) SSH Key 授权$key_hint"
-    say "3) 关闭 SSH 密码登录$hard_hint"
-    say '4) 基础环境初始化'; say '5) 查看当前状态'; say '0) 退出'
+    ui_text "$BOLD$COLOR" "Linux Init Tool  v$VERSION"
+    hint 'Linux 服务器初始化与管理'
+    ui_rule
+    ui_field '系统' "$OS_NAME"
+    ui_field '主机' "$(hostname)"
+    ui_field '当前用户' "$(id -un) / 时区 $(get_timezone)"
+    ui_field 'SSH 密码登录' "$password"; ui_field 'root SSH 登录' "$rootlogin"
+    say ''; ui_text "$BOLD$COLOR" '用户与 SSH'
+    ui_option 1 '创建用户 / 补 sudo 权限'
+    ui_option 2 'SSH Key 授权'
+    if (( UI_HEIGHT >= 30 )); then hint "    $key_hint"; fi
+    ui_option 3 '关闭 SSH 密码登录'
+    if (( UI_HEIGHT >= 30 )); then hint "    $hard_hint"; fi
+    say ''; ui_text "$BOLD$COLOR" '系统与状态'
+    ui_option 4 '基础环境初始化'
+    if (( UI_HEIGHT >= 30 )); then hint '    补齐基础包、设置 UTC，可选系统升级'; fi
+    ui_option 5 '查看当前状态'
+    if (( UI_HEIGHT >= 30 )); then hint '    查看用户、公钥、SSH 模式及软件包'; fi
+    say ''; ui_option 0 '退出'; ui_rule
+    hint '输入编号选择；操作前会再次检查条件。'
+    say ''
 }
 main() {
     local choice
-    [[ -t 0 && -t 1 ]] || { warn '需要交互终端；请使用 bash <(curl -fsSL https://install.dry.li/init)。'; return 1; }
+    setup_ui
+    [[ -t 0 && -t 1 ]] || { error '需要交互终端；请使用 bash <(curl -fsSL https://install.dry.li/init)。'; return 1; }
     require_root || return 1
     detect_os || return 1
     umask 077
@@ -940,15 +1067,14 @@ main() {
     command -v flock >/dev/null || { warn '缺少 flock（util-linux）。'; return 1; }
     exec 9>/run/linux-init.lock
     flock -n 9 || { warn '另一个 Linux Init 正在运行，请稍后再试。'; return 1; }
-    if [[ ${TERM:-dumb} != dumb && -z ${NO_COLOR:-} ]]; then COLOR=$'\033[0;36m'; RESET=$'\033[0m'; fi
     while true; do
         show_menu
-        ask '请选择操作: ' choice || break
+        ask '请选择操作 [0-5]: ' choice || break
         case "$choice" in
-            1) if ! create_user; then warn '用户操作失败，请检查上方错误。'; fi ;;
-            2) if ! authorize_ssh_key; then warn '授权操作失败，请检查上方错误。'; fi ;;
-            3) if ! disable_ssh_password_auth; then rollback_ssh || return 1; warn 'SSH 操作失败，请保留当前会话并检查上方错误。'; fi ;;
-            4) if ! basic_init; then warn '基础初始化中断，请检查上方错误；可重新运行。'; fi ;;
+            1) if ! create_user; then error '用户操作失败，请检查上方错误。'; fi ;;
+            2) if ! authorize_ssh_key; then error '授权操作失败，请检查上方错误。'; fi ;;
+            3) if ! disable_ssh_password_auth; then rollback_ssh || return 1; error 'SSH 操作失败，请保留当前会话并检查上方错误。'; fi ;;
+            4) if ! basic_init; then error '基础初始化中断，请检查上方错误；可重新运行。'; fi ;;
             5) show_status ;;
             0) break ;;
             *) warn '请输入菜单中的编号。'; pause; continue ;;
