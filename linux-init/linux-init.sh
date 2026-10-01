@@ -577,8 +577,14 @@ show_status() {
     say "Administrator prerequisites: $safe"
     say 'SSH 加固还需检查配置结构、服务、sshd -t/-T，并确认新终端实际登录。'
 }
+clear_menu_screen() {
+    if [[ -t 1 && ${TERM:-dumb} != dumb ]]; then
+        printf '\033[2J\033[H'
+    fi
+}
 show_menu() {
     local config password=unknown rootlogin=unknown users key_hint='' hard_hint
+    clear_menu_screen
     users=$(list_login_users)
     [[ -n $users ]] || key_hint=' [需要先创建普通用户]'
     hard_hint=' [需要 sudo + 有效公钥 + 可用本地密码]'
@@ -587,7 +593,7 @@ show_menu() {
         password=$(config_value "$config" passwordauthentication)
         rootlogin=$(config_value "$config" permitrootlogin)
     fi
-    printf '\n%s╭──────────────────────────────╮\n│        Linux Init Tool       │\n╰──────────────────────────────╯%s\n' "$COLOR" "$RESET"
+    printf '%s╭──────────────────────────────╮\n│        Linux Init Tool       │\n╰──────────────────────────────╯%s\n' "$COLOR" "$RESET"
     say "System: $OS_NAME | Host: $(hostname)"
     say "Current user: $(id -un) | Timezone: $(get_timezone)"
     say "SSH password login: $password | Root SSH: $rootlogin"
@@ -620,7 +626,7 @@ main() {
             4) if ! basic_init; then warn '基础初始化中断，请检查上方错误；可重新运行。'; fi ;;
             5) show_status ;;
             0) break ;;
-            *) warn '请输入菜单中的编号。'; continue ;;
+            *) warn '请输入菜单中的编号。'; pause; continue ;;
         esac
         pause
     done
