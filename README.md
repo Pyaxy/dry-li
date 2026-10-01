@@ -7,7 +7,7 @@
 | 目录 | 用途 | 当前版本 |
 | --- | --- | --- |
 | [snell-alpine](./snell-alpine/) | Alpine Linux 低空间环境下安装和管理 Snell + ShadowTLS | 1.3.2 |
-| [linux-init](./linux-init/) | Debian / Ubuntu 可重复运行的交互式初始化管理菜单 | 1.1.0 |
+| [linux-init](./linux-init/) | Debian / Ubuntu 可重复运行的交互式初始化管理菜单 | 1.2.0 |
 
 各脚本的安装方法、兼容范围和注意事项请查看对应目录中的 README。
 
