@@ -1,2 +1,4 @@
 /snell-alpine /snell-alpine/snell-alpine-lowspace.sh 200
 /init /linux-init/linux-init.sh 200
+/favicon.svg /assets/favicon.svg 200
+/favicon.ico /assets/favicon.ico 200

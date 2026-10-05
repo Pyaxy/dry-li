@@ -5,8 +5,9 @@
 # shellcheck source-path=SCRIPTDIR
 set -Eeuo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
-# shellcheck source=linux-init.sh
-source "$SCRIPT_DIR/linux-init.sh"
+SCRIPT_PATH="$SCRIPT_DIR/../public/linux-init/linux-init.sh"
+# shellcheck source=../public/linux-init/linux-init.sh
+source "$SCRIPT_PATH"
 TEST_ROOT=$(mktemp -d)
 TEST_ROOT=$(cd "$TEST_ROOT" && pwd -P)
 TEST_COMPLETED=0
@@ -572,7 +573,7 @@ ok 'pending transaction rollback (same handler used on EXIT/INT/TERM/HUP)'
 
 # Exercise snapshot reconstruction from an actual /dev/fd process-substitution
 # input. No sudo is run: root transport is tested independently of privileges.
-sed '$d' "$SCRIPT_DIR/linux-init.sh" > "$TEST_ROOT/snapshot-source"
+sed '$d' "$SCRIPT_PATH" > "$TEST_ROOT/snapshot-source"
 cat >> "$TEST_ROOT/snapshot-source" <<'SNAPSHOT'
 DEFAULT_SSH_PUBLIC_KEYS=("ssh-ed25519 fixture")
 main() {
@@ -600,7 +601,7 @@ trap 'exit 143' TERM
 printf 'PasswordAuthentication no\n' > "$SSH_DROPIN"
 kill -TERM $$
 SIGNAL
-if bash "$TEST_ROOT/signal-test" "$SCRIPT_DIR/linux-init.sh" "$TEST_ROOT" >/dev/null 2>&1; then fail 'signal returned success'; fi
+if bash "$TEST_ROOT/signal-test" "$SCRIPT_PATH" "$TEST_ROOT" >/dev/null 2>&1; then fail 'signal returned success'; fi
 [[ ! -f $TEST_ROOT/signal-dropin.conf ]] || fail 'signal did not roll back'
 ok 'actual TERM invokes EXIT rollback'
 
