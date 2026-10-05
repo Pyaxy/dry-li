@@ -36,6 +36,8 @@ apk add --no-cache curl ca-certificates
 
 短链接返回当前已部署的脚本，运行后按菜单选择安装或管理功能。
 
+仓库中的脚本位于 `public/snell-alpine/snell-alpine-lowspace.sh`，独立测试位于 `tests/test-snell-binary.sh`。
+
 ### 本地文件运行
 
 下载脚本后，也可以在脚本所在目录以 root 执行：
@@ -57,14 +59,13 @@ ShadowTLS 也按原脚本的顺序配置：生成 16 位密码、询问 TLS 域�
 
 v1.3.2 会在创建或发现现有 Snell/ShadowTLS OpenRC 服务后执行 `rc-update add ... default`，再使用 `rc-update -u` 强制刷新依赖树，并验证 `/etc/runlevels/default/` 中的有效链接。仅运行新版脚本即可修复现有服务的注册缓存，不需要重新安装 Snell 或 ShadowTLS。
 
-也可以先运行不修改现有服务的独立测试：
+在 Alpine 上，从仓库根目录运行不修改现有服务的独立测试：
 
 ```sh
-chmod +x test-snell-binary.sh
-./test-snell-binary.sh v5.0.1
+sh tests/test-snell-binary.sh v5.0.1
 ```
 
-它只在临时目录工作，并使用 `127.0.0.1:39127` 做两秒真实启动测试；结束后自动停止进程并删除文件。若端口已占用，可执行 `TEST_PORT=39128 ./test-snell-binary.sh v5.0.1`。
+它只在临时目录工作，并使用 `127.0.0.1:39127` 做两秒真实启动测试；结束后自动停止进程并删除文件。若端口已占用，可执行 `TEST_PORT=39128 sh tests/test-snell-binary.sh v5.0.1`。
 
 如需先检查脚本内容，可下载到本地，检查后按上述本地文件方式执行。
 

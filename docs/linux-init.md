@@ -28,18 +28,18 @@ bash <(curl -fsSL https://install.dry.li/init)
 
 项目文件：
 
-- `linux-init/linux-init.sh`：唯一对外发布的 Bash 脚本。
-- `linux-init/test-linux-init.sh`：隔离回归测试，不发布。
-- `linux-init/README.md`：使用、恢复与验收说明，不发布。
-- `_redirects`：`/init /linux-init/linux-init.sh 200`，内部重写并返回脚本文本。
-- `build-pages.sh`：沿用发布白名单，将脚本复制到 `dist/linux-init/linux-init.sh`；保留 `/snell-alpine`。
+- `public/linux-init/linux-init.sh`：Linux Init 对外发布的 Bash 脚本。
+- `tests/test-linux-init.sh`：隔离回归测试，不发布。
+- `docs/linux-init.md`：使用、恢复与验收说明，不发布。
+- `public/_redirects`：`/init /linux-init/linux-init.sh 200`，内部重写并返回脚本文本。
+- `build-pages.sh`：将整个 `public/` 复制到 `dist/`；保留 `/init` 和 `/snell-alpine`。
 - 根 `README.md`：入口和脚本索引。
 
 仍使用 `sh build-pages.sh` 构建、`dist` 作为 Pages 输出目录。这里只准备仓库文件，不自动推送或部署。
 
 ## 填写预置公钥
 
-修改 `linux-init/linux-init.sh` 顶部：
+修改 `public/linux-init/linux-init.sh` 顶部：
 
 ```bash
 DEFAULT_SSH_PUBLIC_KEYS=(
@@ -207,16 +207,16 @@ journalctl -u ssh.service -n 60 --no-pager
 本地隔离测试（不需要 sudo）：
 
 ```bash
-bash -n linux-init/linux-init.sh
-bash linux-init/test-linux-init.sh
-shellcheck -x linux-init/linux-init.sh linux-init/test-linux-init.sh build-pages.sh
+bash -n public/linux-init/linux-init.sh
+bash tests/test-linux-init.sh
+shellcheck -x public/linux-init/linux-init.sh tests/test-linux-init.sh build-pages.sh
 sh build-pages.sh
 ```
 
 隔离测试只 source 函数，使用临时用户/配置数据和模拟管理命令。
 公钥校验及 `sshd -t/-T/-C` 使用真实 OpenSSH，仅读取临时配置/host key，不启动 daemon，不修改宿主机 SSH。
 覆盖 root-only、用户筛选、已有用户补 sudo、key 去重/损坏数据/权限/链接、锁定/到期/sudo 策略、Include/cloud-init 冲突、Match/服务参数拒绝、公钥算法拒绝、socket/service 迁移（同时活动、仅 socket 活动、仅启用、runtime 启用、sshd 别名）、逐步骤失败及原模式回滚、不安全停止策略/端口/地址拒绝、状态页、确认期间启动方式变化、首次及候选语法失败、reload 失败/延迟退出/恢复失败去重、TERM 回滚、process-substitution 重建，以及基础安装/升级确认。
-测试脚本和 README 不在 dist 白名单内，Snell 脚本内容保持不变。
+测试脚本和 README 位于 `public/` 外，不进入 `dist/`。
 
 当前已在本地 macOS 的 Bash 和 OpenSSH 上运行隔离测试及 ShellCheck；**未完成各 Debian/Ubuntu 版本/架构的真实 VM/LXC 安装、systemd 迁移/reload 和新连接登录验收**。
 上述版本列表是实现支持范围，不能据此视为全部已实机验证。
@@ -230,7 +230,7 @@ sh build-pages.sh
 5. 加入 `50-cloud-init.conf` 的 PasswordAuthentication yes，验证工具最终值仍正确；加入更早冲突、Match 或自定义服务选项，验证工具拒绝且不 reload。
 6. Debian 13/LXC 使用 ssh.socket + ssh.service 同时活动，确认加固走无 HUP 的迁移路径、旧会话保留、服务 active、socket inactive/disabled、22 由 sshd 持有；再验证 socket-only 和 Ubuntu。
 7. 模拟配置错误、迁移逐步失败、reload 失败、中途 TERM，核对备份、原服务/socket 状态回滚和原会话。
-8. 以普通用户实际执行 `bash <(cat linux-init/linux-init.sh)`，验证 sudo 提权和返回菜单；重复新增相同 key、已有用户、加固和基础初始化，验证幂等。
+8. 以普通用户实际执行 `bash <(cat public/linux-init/linux-init.sh)`，验证 sudo 提权和返回菜单；重复新增相同 key、已有用户、加固和基础初始化，验证幂等。
 9. 在测试机拒绝 full-upgrade，检查只执行更新索引、补包和 UTC；允许升级时检查结果和重启标记，确认没有自动 reboot。
 
 ## 典型流程
