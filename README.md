@@ -1,6 +1,6 @@
 # dry.li
 
-<img src="./public/assets/favicon.svg" width="48" height="48" alt="dry.li 图标">
+<img src="./public/assets/logo.svg" width="48" height="48" alt="dry.li 图标">
 
 个人维护的 Linux 安装与运维脚本，以及 dry.li 的图标和静态资源。
 
@@ -49,8 +49,8 @@ apk add --no-cache curl ca-certificates
 
 ## 图标与静态资源
 
-[assets](./public/assets/) 收录 dry.li 的 SVG 图标、深浅色版本、PNG 和 ICO favicon。
+[assets](./public/assets/) 提供 dry.li 绿色 S3 图标，包括跟随系统主题的 SVG，以及固定深浅色的 PNG 和 ICO favicon。
 
-- [图标集合](./public/assets/icons/)
-- [图标对比图](./public/assets/previews/comparison.svg)
+- [SVG 图标](./public/assets/logo.svg)
+- [浅色资源](./public/assets/light/) · [深色资源](./public/assets/dark/)
 - [文件索引与引用方法](./docs/assets.md)
