@@ -47,10 +47,12 @@ README 和测试留在 `public/` 外。默认图标的维护方法见 [资源说
 sh -n build-pages.sh
 sh -n public/snell-alpine/snell-alpine-lowspace.sh
 sh -n tests/test-snell-binary.sh
+sh tests/test-snell-release.sh
 bash -n public/linux-init/linux-init.sh
 bash tests/test-linux-init.sh
 sh build-pages.sh
 ```
 
-Linux Init 测试使用临时数据和模拟管理命令，不修改本机账号或服务。
+`test-linux-init.sh` 使用临时数据和模拟管理命令，不修改本机账号或服务。
+`test-linux-init-alpine.sh` 则会修改用户、sudo、SSH 和时区，仅允许在一次性 Alpine Docker 容器中运行；启动命令见 [Linux Init 使用说明](./linux-init.md#测试与上线前验收)。
 Snell 二进制测试需要 Alpine，运行方法见 [Snell Alpine 使用说明](./snell-alpine.md)。

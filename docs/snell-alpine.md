@@ -19,13 +19,13 @@
 在 Alpine 服务器上，以 root 用户复制执行：
 
 ```sh
-sh -c "$(curl -fsSL https://install.dry.li/snell-alpine)"
+sh -c "$(curl -fsSL https://dry.li/snell-alpine)"
 ```
 
 普通用户（已配置 sudo）使用：
 
 ```sh
-sudo sh -c "$(curl -fsSL https://install.dry.li/snell-alpine)"
+sudo sh -c "$(curl -fsSL https://dry.li/snell-alpine)"
 ```
 
 若提示 `curl: not found`，先以 root 执行：
@@ -36,7 +36,11 @@ apk add --no-cache curl ca-certificates
 
 短链接返回当前已部署的脚本，运行后按菜单选择安装或管理功能。
 
+v1.3.3 修复版本发现：优先读取 Surge 官方发布历史的 Markdown，必要时读取 HTML，同时识别版本标题和下载文件名。这样即使发布页只展示新通道的下载链接，仍能识别只有发布记录的 v5；各通道独立按版本排序。获取页面失败与页面缺少对应版本会显示不同的回退原因。
+下载地址仍采用 `https://dl.nssurge.com/snell/snell-server-<版本>-linux-<架构>.zip`；版本发现失败不等于下载地址失效。发布信息来源：[Surge Snell 发布历史](https://kb.nssurge.com/surge-knowledge-base/release-notes/snell)。
+
 仓库中的脚本位于 `public/snell-alpine/snell-alpine-lowspace.sh`，独立测试位于 `tests/test-snell-binary.sh`。
+版本解析的离线回归测试为 `sh tests/test-snell-release.sh`，不下载软件、不修改服务。
 
 ### 本地文件运行
 

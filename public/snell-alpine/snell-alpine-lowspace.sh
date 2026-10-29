@@ -7,7 +7,7 @@ set -u
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
 CYAN='\033[0;36m'; RESET='\033[0m'
-VERSION="1.3.2"
+VERSION="1.3.3"
 
 INSTALL_DIR="/usr/local/bin"
 STATE_DIR="/etc/snell-alpine-lowspace"
@@ -251,21 +251,39 @@ snell_version_sort_key() {
     }'
 }
 
-latest_snell_version() {
-    major=${1#v}; fallback=$2
-    notes=$(curl -fsSL --connect-timeout 8 --max-time 20 \
-      https://kb.nssurge.com/surge-knowledge-base/release-notes/snell 2>/dev/null || true)
-    ver=$(printf '%s' "$notes" | grep -oE "snell-server-v${major}\.[0-9]+\.[0-9]+[a-zA-Z0-9]*" \
-      | sed 's/^snell-server-v//' | sort -u | while read -r v; do
+snell_version_from_notes() {
+    local major=${1#v} v
+    case "$major" in 4|5|6) ;; *) return 1 ;; esac
+    # GitBook may keep old release headings after removing their download links.
+    # Accept Markdown headings and HTML heading text, as well as asset names.
+    sed 's/<[^>]*>/\
+/g' | grep -oE "snell-server-v${major}\.[0-9]+\.[0-9]+[a-zA-Z0-9]*|^[[:space:]#]*v${major}\.[0-9]+\.[0-9]+[a-zA-Z0-9]*([[:space:]]|$)" \
+      | sed -E 's/^.*v//; s/[[:space:]]+$//' | sort -u | while read -r v; do
           printf '%s %s\n' "$(snell_version_sort_key "$v")" "$v"
-        done | sort | tail -n 1 | awk '{print $2}')
-    if [ -n "$ver" ]; then
-      say "${GREEN}从 Surge 发布历史解析到 v${major} 最新版本: v${ver}${RESET}" >&2
-      echo "v$ver"
+        done | sort | tail -n 1 | awk '{print $2}'
+}
+
+latest_snell_version() {
+    local major=${1#v} fallback=$2 notes ver url fetched=false
+    for url in \
+      https://kb.nssurge.com/surge-knowledge-base/release-notes/snell.md \
+      https://kb.nssurge.com/surge-knowledge-base/release-notes/snell; do
+      if notes=$(curl -fsSL --connect-timeout 8 --max-time 20 "$url" 2>/dev/null); then
+        fetched=true
+        ver=$(printf '%s\n' "$notes" | snell_version_from_notes "$major")
+        if [ -n "$ver" ]; then
+          say "${GREEN}从 Surge 发布历史解析到 v${major} 最新版本: v${ver}${RESET}" >&2
+          echo "v$ver"
+          return 0
+        fi
+      fi
+    done
+    if $fetched; then
+      say "${YELLOW}Surge 发布历史中未找到 v${major} 版本，使用内置回退版本: ${fallback}${RESET}" >&2
     else
-      say "${YELLOW}未能从 Surge 发布历史解析 v${major}，使用内置回退版本: ${fallback}${RESET}" >&2
-      echo "$fallback"
+      say "${YELLOW}无法获取 Surge 发布历史（网络或 HTTP 错误），使用内置回退版本: ${fallback}${RESET}" >&2
     fi
+    echo "$fallback"
 }
 
 installed_snell_channels() {

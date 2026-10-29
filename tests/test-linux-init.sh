@@ -4,6 +4,7 @@
 # shellcheck disable=SC2016,SC2034
 # shellcheck source-path=SCRIPTDIR
 set -Eeuo pipefail
+umask 022
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 SCRIPT_PATH="$SCRIPT_DIR/../public/linux-init/linux-init.sh"
 # shellcheck source=../public/linux-init/linux-init.sh
@@ -277,10 +278,12 @@ ok 'root-only machine: key authorization and hardening safely return'
 : > "$LOG"
 create_user <<< $'ppy\n2' >/dev/null
 [[ ! -s $LOG ]] || fail 'existing user changed'
-SUDO_MEMBER=no
-package_installed() { return 0; }
-create_user <<< $'ppy\n1' >/dev/null
-[[ $(cat "$LOG") == 'usermod -aG sudo ppy' ]] || fail 'supplemental sudo grant'
+(
+    SUDO_MEMBER=no
+    package_installed() { return 0; }
+    create_user <<< $'ppy\n1' >/dev/null
+    [[ $(cat "$LOG") == 'usermod -aG sudo ppy' ]] || fail 'supplemental sudo grant'
+)
 SUDO_MEMBER=yes
 ok 'existing user and supplemental sudo'
 
@@ -621,5 +624,114 @@ ok 'actual TERM invokes EXIT rollback'
     [[ ! -s $LOG ]] || fail 'cancelled base init executed'
 )
 ok 'base init: missing packages only, optional/default upgrade, cancel'
+
+# Alpine/OpenRC failures are isolated as well: no live init, process or package
+# changes. The separate container suite exercises actual Alpine commands/logins.
+(
+    OS_FAMILY=alpine; SERVICE_MANAGER=openrc; ADMIN_GROUP=wheel
+    SSH_OPENRC_INIT="$TEST_ROOT/init.d/sshd"
+    SSH_OPENRC_CONF="$TEST_ROOT/conf.d/sshd"
+    SSH_PIDFILE="$TEST_ROOT/pid"
+    mkdir -p "$(dirname "$SSH_OPENRC_INIT")" "$(dirname "$SSH_OPENRC_CONF")"
+    printf '#!/sbin/openrc-run\n' > "$SSH_OPENRC_INIT"
+    chmod 755 "$SSH_OPENRC_INIT"
+    : > "$SSH_OPENRC_CONF"
+    AUDIT_CHANGED=no
+    apk() {
+        case "$*" in
+            "info --who-owns $SSH_OPENRC_INIT") printf '%s is owned by openssh-server-common-openrc-1.0\n' "$SSH_OPENRC_INIT" ;;
+            audit*) if [[ $AUDIT_CHANGED == yes ]]; then printf 'U %s\n' "${SSH_OPENRC_INIT#/}"; fi ;;
+            "info --installed sudo"|"info --installed curl") return 0 ;;
+            "info --installed "*) return 1 ;;
+            *) printf 'apk %s\n' "$*" >> "$LOG" ;;
+        esac
+    }
+    systemctl() { fail "OpenRC called systemctl: $*"; }
+    ssh_master_pid() { printf '4321\n'; }
+    rc-service() {
+        if [[ $2 == status ]]; then [[ $FAKE_SERVICE_ACTIVE == yes ]] && return 0; return 3; fi
+        printf 'rc-service %s\n' "$*" >> "$LOG"
+        case "$2" in
+            reload)
+                if (( RELOAD_EXIT )); then
+                    RELOAD_EXIT=0; FAKE_SERVICE_ACTIVE=no; FAKE_LISTENER_OWNER=missing
+                    rm -f "$SSH_PIDFILE"; return 1
+                fi
+                (( ! RELOAD_PERSISTENT_FAILURE )) || return 1
+                if (( RELOAD_FAIL )); then RELOAD_FAIL=0; return 1; fi ;;
+            zap) ;;
+            start) FAKE_SERVICE_ACTIVE=yes; FAKE_LISTENER_OWNER=sshd ;;
+            *) fail "Unexpected OpenRC operation: $*" ;;
+        esac
+    }
+    reset_config
+    disable_ssh_password_auth <<< y >/dev/null
+    grep -qx 'rc-service sshd reload' "$LOG" || fail 'OpenRC reload not used'
+    key_only_values "$(get_effective_sshd_config)" || fail 'OpenRC settings not applied'
+    cp "$LOG" "$TEST_ROOT/openrc-actions"
+    disable_ssh_password_auth <<< y >/dev/null
+    cmp "$LOG" "$TEST_ROOT/openrc-actions" || fail 'OpenRC repeat action reloaded'
+    show_ssh_runtime_status > "$TEST_ROOT/openrc-status"
+    grep -q 'Manager: openrc' "$TEST_ROOT/openrc-status" || fail 'OpenRC status manager'
+    grep -q 'Socket: not-applicable' "$TEST_ROOT/openrc-status" || fail 'OpenRC socket status'
+    ok 'OpenRC applies and reports service mode, preserves idempotence, never calls systemctl'
+
+    for unsafe in args hook runlevel-config pidfile listener syntax; do
+        reset_config; AUDIT_CHANGED=no; : > "$SSH_OPENRC_CONF"
+        case "$unsafe" in
+            args) printf 'command_args="-f /custom/sshd_config"\n' > "$SSH_OPENRC_CONF" ;;
+            hook) AUDIT_CHANGED=yes ;;
+            runlevel-config) touch "$SSH_OPENRC_CONF.default" ;;
+            pidfile) SSH_PIDFILE="$TEST_ROOT/wrong.pid" ;;
+            listener) FAKE_LISTENER_OWNER=shared ;;
+            syntax) printf 'InvalidSSHDirective yes\n' >> "$SSHD_CONFIG" ;;
+        esac
+        disable_ssh_password_auth <<< y >/dev/null 2>&1 || true
+        [[ ! -f $SSH_DROPIN && ! -s $LOG ]] || fail "unsafe OpenRC $unsafe touched config/service"
+        SSH_PIDFILE="$TEST_ROOT/pid"; rm -f "$SSH_OPENRC_CONF.default"
+    done
+    AUDIT_CHANGED=no; : > "$SSH_OPENRC_CONF"
+    ok 'OpenRC refuses custom args/hooks/runlevel config/PID, shared listeners and invalid syntax'
+
+    for fault in reload exit persistent candidate; do
+        reset_config
+        printf 'PasswordAuthentication yes\n' > "$SSH_DROPIN"
+        cp "$SSH_DROPIN" "$TEST_ROOT/openrc-before"
+        case "$fault" in
+            reload) RELOAD_FAIL=1 ;;
+            exit) RELOAD_EXIT=1 ;;
+            persistent) RELOAD_PERSISTENT_FAILURE=1 ;;
+            candidate) SYNTAX_FAIL=1 ;;
+        esac
+        if disable_ssh_password_auth <<< y >/dev/null 2>&1; then fail "OpenRC $fault falsely succeeded"; fi
+        cmp "$SSH_DROPIN" "$TEST_ROOT/openrc-before" || fail "OpenRC $fault lost prior config"
+        case "$fault" in
+            reload) [[ $(grep -c 'rc-service sshd reload' "$LOG") == 2 ]] || fail 'OpenRC rollback missing reload' ;;
+            exit)
+                grep -qx 'rc-service sshd zap' "$LOG" || fail 'OpenRC stale state not cleared'
+                grep -qx 'rc-service sshd start' "$LOG" || fail 'OpenRC stopped listener not restored'
+                [[ $SSH_ROLLBACK_FAILED == 0 ]] || fail 'OpenRC recovery falsely failed' ;;
+            persistent) [[ $SSH_ROLLBACK_FAILED == 1 ]] || fail 'OpenRC recovery failure not terminal' ;;
+            candidate) if grep -q '^rc-service ' "$LOG"; then fail 'OpenRC invalid candidate touched service'; fi ;;
+        esac
+        cp "$LOG" "$TEST_ROOT/openrc-restored"
+        rollback_ssh >/dev/null 2>&1 || true
+        cmp "$LOG" "$TEST_ROOT/openrc-restored" || fail 'OpenRC rollback repeated'
+    done
+    ok 'OpenRC rollback: reload failure, exited listener, persistent failure and invalid candidate'
+
+    reset_config
+    BASIC_PACKAGES=(sudo curl tzdata)
+    configure_timezone() { printf 'timezone UTC\n' >> "$LOG"; }
+    basic_init <<< $'y\nn' >/dev/null
+    grep -qx 'apk update' "$LOG" || fail 'Alpine index update'
+    grep -qx 'apk add tzdata' "$LOG" || fail 'Alpine missing package detection'
+    if grep -q 'apk upgrade' "$LOG"; then fail 'Alpine declined upgrade executed'; fi
+    : > "$LOG"
+    basic_init <<< $'y\ny' >/dev/null
+    grep -qx 'apk upgrade' "$LOG" || fail 'Alpine upgrade'
+    if grep -q apt-get "$LOG"; then fail 'Alpine used apt'; fi
+    ok 'Alpine package detection, missing packages and optional current-release upgrade'
+)
 printf '\nAll isolated tests passed. No daemon was started or host configuration modified.\n'
 TEST_COMPLETED=1

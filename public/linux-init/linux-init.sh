@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
-# Repeatable Debian/Ubuntu administration menu. No changes until an action is selected.
+# Repeatable Debian/Ubuntu/Alpine menu. No changes until an action is selected.
 set -Eeuo pipefail
 
 # Configuration: put one complete public key on each line. Never put private keys here.
 DEFAULT_SSH_PUBLIC_KEYS=(
     # "ssh-ed25519 AAAA... user@example"
 )
-VERSION="1.2.0"
+VERSION="1.3.0"
 BASIC_PACKAGES=(sudo curl ca-certificates git vim htop unzip)
+OS_FAMILY=debian
+ADMIN_GROUP=sudo
+SERVICE_MANAGER=systemd
+SSH_OPENRC_INIT=/etc/init.d/sshd
+SSH_OPENRC_CONF=/etc/conf.d/sshd
+SSH_PIDFILE=/run/sshd.pid
+SUDOERS_DIR=/etc/sudoers.d
 SSHD_CONFIG="/etc/ssh/sshd_config"
 SSH_DROPIN_DIR="/etc/ssh/sshd_config.d"
 SSH_DROPIN="/etc/ssh/sshd_config.d/00-key-only.conf"
@@ -127,6 +134,7 @@ write_elevated_script() {
         declare -p WORK_DIR SSH_BACKUP SSH_CANDIDATE SSH_TRANSACTION SSH_PREVIOUS_EXISTS SSH_RELOAD_ATTEMPTED SSH_ROLLBACK_FAILED SSH_SERVICE SSHD OS_NAME UID_MIN UID_MAX COLOR RESET
         declare -p SSH_SOCKET SSH_RUNTIME_DIR SSH_MIGRATION_NEEDED SSH_MODE_CHANGED SSH_RUNTIME_STATE SSH_ORIGINAL_SERVICE_ACTIVE SSH_ORIGINAL_SERVICE_ENABLED SSH_ORIGINAL_SOCKET_ACTIVE SSH_ORIGINAL_SOCKET_ENABLED
         declare -p GREEN YELLOW RED MUTED BOLD UI_WIDTH UI_HEIGHT
+        declare -p OS_FAMILY ADMIN_GROUP SERVICE_MANAGER SSH_OPENRC_INIT SSH_OPENRC_CONF SSH_PIDFILE SUDOERS_DIR
         # sudo may filter this preference from the environment.
         if [[ -n ${NO_COLOR+x} ]]; then declare -p NO_COLOR; fi
         declare -f
@@ -153,14 +161,24 @@ detect_os() {
     # shellcheck source=/dev/null
     . /etc/os-release
     case "$ID:$VERSION_ID" in
-        debian:12|debian:13|ubuntu:22.04|ubuntu:24.04|ubuntu:26.04) ;;
-        *) warn "仅支持 Debian 12/13、Ubuntu 22.04/24.04/26.04（当前 $ID ${VERSION_ID}）。"; return 1 ;;
+        debian:12|debian:13|ubuntu:22.04|ubuntu:24.04|ubuntu:26.04)
+            OS_FAMILY=debian; ADMIN_GROUP=sudo; SERVICE_MANAGER=systemd
+            command -v apt-get >/dev/null || return 1 ;;
+        alpine:3.*)
+            [[ $VERSION_ID =~ ^3\.[0-9]+\.[0-9]+$ ]] || { warn '暂不支持 Alpine edge/testing。'; return 1; }
+            OS_FAMILY=alpine; ADMIN_GROUP=wheel; SERVICE_MANAGER=openrc
+            SSH_RUNTIME_DIR=/var/empty
+            BASIC_PACKAGES=(sudo curl ca-certificates git vim htop unzip bash openssh-keygen iproute2-ss tzdata ncurses)
+            command -v apk >/dev/null || return 1 ;;
+        *) warn "支持 Debian 12/13、Ubuntu 22.04/24.04/26.04、Alpine 3.x（当前 $ID ${VERSION_ID}）。"; return 1 ;;
     esac
     case "$(uname -m)" in x86_64|aarch64|amd64|arm64) ;; *) warn '仅支持 amd64 / arm64。'; return 1 ;; esac
-    command -v apt-get >/dev/null 2>&1 || return 1
     OS_NAME=${PRETTY_NAME:-$ID $VERSION_ID}
-    UID_MIN=$(awk '$1 == "UID_MIN" {print $2; exit}' /etc/login.defs)
-    UID_MAX=$(awk '$1 == "UID_MAX" {print $2; exit}' /etc/login.defs)
+    UID_MIN=''; UID_MAX=''
+    if [[ -r /etc/login.defs ]]; then
+        UID_MIN=$(awk '$1 == "UID_MIN" {print $2; exit}' /etc/login.defs)
+        UID_MAX=$(awk '$1 == "UID_MAX" {print $2; exit}' /etc/login.defs)
+    fi
     UID_MIN=${UID_MIN:-1000}; UID_MAX=${UID_MAX:-60000}
     [[ $UID_MIN =~ ^[0-9]+$ && $UID_MAX =~ ^[0-9]+$ ]] || return 1
     if [[ -x /usr/sbin/sshd ]]; then SSHD=/usr/sbin/sshd; else SSHD=$(command -v sshd || true); fi
@@ -168,7 +186,16 @@ detect_os() {
 
 user_exists() { getent passwd "$1" >/dev/null; }
 user_home() { getent passwd "$1" | cut -d: -f6; }
-user_has_sudo() { id -nG "$1" | tr ' ' '\n' | grep -x sudo >/dev/null; }
+sudo_policy_ready() {
+    command -v sudo >/dev/null && command -v visudo >/dev/null || return 1
+    LC_ALL=C visudo -c >/dev/null 2>&1 || return 1
+    LC_ALL=C sudo -l -U "$1" 2>/dev/null | grep -E '\(ALL( : ALL)?\) ALL[[:space:]]*$' >/dev/null
+}
+user_has_sudo() {
+    # On Alpine, wheel membership alone does not activate a sudo policy.
+    if [[ $OS_FAMILY == alpine ]]; then sudo_policy_ready "$1"
+    else id -nG "$1" | tr ' ' '\n' | grep -x "$ADMIN_GROUP" >/dev/null; fi
+}
 sudo_label() { if user_has_sudo "$1"; then printf yes; else printf no; fi; }
 list_login_users() {
     local name _password uid _gid _gecos home shell
@@ -252,9 +279,7 @@ account_password_ready() {
 admin_ready() {
     local user=$1 home line
     user_has_sudo "$user" && account_password_ready "$user" || return 1
-    command -v sudo >/dev/null && command -v visudo >/dev/null || return 1
-    LC_ALL=C visudo -c >/dev/null 2>&1 || return 1
-    LC_ALL=C sudo -l -U "$user" 2>/dev/null | grep -E '\(ALL( : ALL)?\) ALL[[:space:]]*$' >/dev/null || return 1
+    sudo_policy_ready "$user" || return 1
     home=$(user_home "$user")
     safe_key_path "$home/.ssh/authorized_keys" "$(id -u "$user")" || return 1
     while IFS= read -r line || [[ -n $line ]]; do
@@ -273,18 +298,63 @@ check_ssh_hardening_readiness() {
     (( ${#READY_USERS[@]} > 0 ))
 }
 
-package_installed() { [[ $(dpkg-query -W -f='${Status}' "$1" 2>/dev/null || true) == 'install ok installed' ]]; }
+package_installed() {
+    if [[ $OS_FAMILY == alpine ]]; then apk info --installed "$1" >/dev/null 2>&1
+    else [[ $(dpkg-query -W -f='${Status}' "$1" 2>/dev/null || true) == 'install ok installed' ]]; fi
+}
+update_package_index() {
+    if [[ $OS_FAMILY == alpine ]]; then apk update; else apt-get update; fi
+}
+add_packages() {
+    if [[ $OS_FAMILY == alpine ]]; then
+        apk add "$@" || { warn 'apk 安装失败；请检查当前稳定版的 main/community 仓库与网络，不要混用 edge。'; return 1; }
+    else apt-get install -y "$@"; fi
+}
 install_packages() {
     local package missing=()
     for package in "$@"; do
         if ! package_installed "$package"; then missing+=("$package"); fi
     done
     if (( ${#missing[@]} )); then
-        apt-get update && apt-get install -y "${missing[@]}" || return 1
+        update_package_index && add_packages "${missing[@]}" || return 1
     fi
+}
+grant_alpine_sudo() {
+    local user=$1 target="$SUDOERS_DIR/linux-init-$1" candidate previous='' failed=0
+    if package_installed doas-sudo-shim; then
+        warn '检测到 doas-sudo-shim；本工具需要真实 sudo/visudo，请先人工处理冲突，现有 doas 配置不会被替换。'; return 1
+    fi
+    install_packages sudo || return 1
+    if sudo_policy_ready "$user"; then success "$user 已具有 sudo 管理权限。"; return 0; fi
+    visudo -c >/dev/null || { warn '现有 sudo 配置有误，未修改。'; return 1; }
+    [[ -d $SUDOERS_DIR && ! -L $SUDOERS_DIR && ! -L $target ]] || return 1
+    if [[ -e $target ]]; then
+        if [[ ! -f $target ]] || ! grep -Fxq '# Managed by Linux Init Tool' "$target"; then
+            warn "不覆盖非本工具管理的 sudo 配置: $target"; return 1;
+        fi
+        previous=$(mktemp "$WORK_DIR/sudo-previous.XXXXXX") || return 1
+        cp -p "$target" "$previous" || return 1
+    fi
+    candidate=$(mktemp "$SUDOERS_DIR/.linux-init.XXXXXX") || return 1
+    if ! {
+        printf '# Managed by Linux Init Tool\n%s ALL=(ALL:ALL) ALL\n' "$user" > "$candidate" &&
+        chmod 0440 "$candidate" && chown root:root "$candidate" && visudo -cf "$candidate" >/dev/null
+    }; then rm -f "$candidate"; return 1; fi
+    # Limit the grant to this user; do not enable every existing wheel member.
+    if ! getent group wheel >/dev/null || ! addgroup "$user" wheel; then rm -f "$candidate"; return 1; fi
+    mv -f "$candidate" "$target" || return 1
+    sudo_policy_ready "$user" || failed=1
+    if (( failed )); then
+        if [[ -n $previous ]]; then cp -p "$previous" "$target" || return 1
+        else rm -f "$target" || return 1; fi
+        warn 'sudo 授权未生效，已恢复原授权文件；请检查 sudoers 是否包含 /etc/sudoers.d。'; return 1
+    fi
+    success "$user 已加入 wheel 并获得需要密码的 sudo 权限。"
+    hint '重新登录后组权限生效；sudo 使用该用户的 Linux 密码。'
 }
 grant_sudo() {
     local user=$1
+    if [[ $OS_FAMILY == alpine ]]; then grant_alpine_sudo "$user"; return; fi
     if user_has_sudo "$user"; then success "$user 已属于 sudo 组，无需重复添加。"; return 0; fi
     install_packages sudo || return 1
     getent group sudo >/dev/null || { warn '缺少 sudo 组，请检查 sudo 安装。'; return 1; }
@@ -297,7 +367,8 @@ show_user() {
     ui_field '用户' "$user"
     ui_field 'Home' "$(user_home "$user")"
     ui_field 'Shell' "$(getent passwd "$user" | cut -d: -f7)"
-    if user_has_sudo "$user"; then ui_field 'sudo 组' '已加入' good; else ui_field 'sudo 组' '未加入' caution; fi
+    if user_has_sudo "$user"; then ui_field 'sudo' '已配置' good; else ui_field 'sudo' '未配置' caution; fi
+    ui_field '用户组' "$(id -nG "$user")"
     ui_field '有效 SSH Key' "$(count_authorized_keys "$user")"
 }
 create_user() {
@@ -318,8 +389,12 @@ create_user() {
         return 0
     fi
     [[ ! -e /home/$user && ! -L /home/$user ]] || { warn '同名 home 路径已存在，拒绝使用。'; return 0; }
-    install_packages sudo || return 1
-    useradd -m -d "/home/$user" -s /bin/bash "$user" || return 1
+    if [[ $OS_FAMILY == alpine ]]; then
+        adduser -D -h "/home/$user" -s /bin/bash "$user" || return 1
+    else
+        install_packages sudo || return 1
+        useradd -m -d "/home/$user" -s /bin/bash "$user" || return 1
+    fi
     info '请设置 Linux 密码，用于 sudo / Console：'
     if ! passwd "$user"; then
         warn "密码未设置成功；用户已保留，请用 passwd $user 重试。SSH 加固会拒绝这个账号。"
@@ -425,7 +500,7 @@ key_only_values() {
     (( failed == 0 ))
 }
 
-# Only the standard, globally included Debian/Ubuntu layout can be modified.
+# Only the standard, globally included OpenSSH layout can be modified.
 # Complex access policies need an operator audit, not an optimistic -T check.
 check_supported_ssh_layout() {
     local file config
@@ -468,14 +543,82 @@ check_supported_ssh_layout() {
 # Read explicit is-active/is-enabled results: their nonzero inactive/disabled
 # exit codes are expected, but transitional or unrecognized states are not.
 ssh_active_state() {
-    local state
+    local state status=0
+    if [[ $SERVICE_MANAGER == openrc ]]; then
+        if [[ ! -x $SSH_OPENRC_INIT ]] || ! command -v rc-service >/dev/null; then printf 'unknown\n'; return; fi
+        rc-service "$1" status >/dev/null 2>&1 || status=$?
+        case "$status" in 0) printf 'active\n' ;; 3) printf 'inactive\n' ;; 1) printf 'failed\n' ;; *) printf 'unknown\n' ;; esac
+        return
+    fi
     state=$(systemctl is-active "$1" 2>/dev/null) || true
     case "$state" in active|inactive|failed|unknown) printf '%s\n' "$state" ;; *) return 1 ;; esac
 }
 ssh_enabled_state() {
-    local state
+    local state entry
+    if [[ $SERVICE_MANAGER == openrc ]]; then
+        for entry in /etc/runlevels/*/"$1"; do
+            if [[ -L $entry && $(readlink -f "$entry") == "$SSH_OPENRC_INIT" ]]; then printf 'enabled\n'; return; fi
+        done
+        printf 'disabled\n'; return
+    fi
     state=$(systemctl is-enabled "$1" 2>/dev/null) || true
     case "$state" in enabled|enabled-runtime|disabled|masked|masked-runtime|static|alias|not-found) printf '%s\n' "$state" ;; *) return 1 ;; esac
+}
+ssh_service_active() { [[ $(ssh_active_state "$SSH_SERVICE") == active ]]; }
+ssh_master_pid() {
+    local pid
+    if [[ $SERVICE_MANAGER == openrc ]]; then
+        [[ -f $SSH_PIDFILE && ! -L $SSH_PIDFILE ]] || return 1
+        pid=$(cat "$SSH_PIDFILE") || return 1
+        [[ $pid =~ ^[1-9][0-9]{0,9}$ ]] || return 1
+        # A stale PID file or a PAM/Kerberos variant must not authorize a HUP.
+        [[ $(readlink -f "/proc/$pid/exe") == "$(readlink -f "$SSHD")" ]] || return 1
+        printf '%s\n' "$pid"
+    else systemctl show "$SSH_SERVICE" -p MainPID --value; fi
+}
+check_openrc_ssh_definition() {
+    local owner changes file
+    command -v rc-service >/dev/null || { warn 'SSH 加固需要 OpenRC 管理的 OpenSSH sshd 服务。'; return 1; }
+    [[ -x $SSH_OPENRC_INIT && ! -L $SSH_OPENRC_INIT ]] || { warn '没有标准 OpenRC sshd 服务；不会自动替换 Dropbear。'; return 1; }
+    # Custom init scripts can kill session children. Require the installed
+    # package's intact script, including permissions; --full includes /etc.
+    owner=$(apk info --who-owns "$SSH_OPENRC_INIT" 2>/dev/null) || return 1
+    [[ $owner == *' owned by openssh-'*'-openrc-'* ]] || { warn 'sshd 服务脚本不属于 Alpine OpenSSH OpenRC 软件包。'; return 1; }
+    changes=$(apk audit --full --check-permissions "$(dirname "$SSH_OPENRC_INIT")/") || return 1
+    if awk -v path="${SSH_OPENRC_INIT#/}" 'substr($0,3)==path || substr($0,3)=="/"path {found=1} END {exit !found}' <<< "$changes"; then
+        warn 'OpenRC sshd 服务脚本已被修改，需人工审查 reload/启动钩子。'; return 1
+    fi
+    # Never execute conf.d contents in this shell. Admit only defaults and
+    # empty options; custom files/arguments could invalidate our -t/-T checks.
+    for file in "$SSH_OPENRC_CONF" "$SSH_OPENRC_CONF".*; do
+        [[ -e $file || -L $file ]] || continue
+        [[ $file == "$SSH_OPENRC_CONF" && -f $file && ! -L $file ]] || {
+            warn "存在额外 OpenRC SSH 配置，需人工审查: $file"; return 1;
+        }
+        if ! awk '
+            /^[[:space:]]*(#|$)/ {next}
+            /^[[:space:]]*(command_args|SSHD_OPTS)=("")?[[:space:]]*(#.*)?$/ {next}
+            /^[[:space:]]*cfgfile="\/etc\/ssh\/sshd_config"[[:space:]]*(#.*)?$/ {next}
+            /^[[:space:]]*sshd_disable_keygen=(yes|no|"yes"|"no")[[:space:]]*(#.*)?$/ {next}
+            {exit 1}
+        ' "$file"; then warn "OpenRC SSH 启动配置非标准: $file"; return 1; fi
+    done
+    [[ ! -x /usr/sbin/sshd.pam && ! -x /usr/sbin/sshd.krb5 ]] || {
+        warn '存在 sshd PAM/Kerberos 变体，需人工核对实际守护进程及配置。'; return 1;
+    }
+    [[ $(config_value "$(get_effective_sshd_config)" pidfile) == "$SSH_PIDFILE" ]] || {
+        warn 'OpenRC sshd 使用非标准 PidFile，拒绝自动应用。'; return 1;
+    }
+}
+check_openrc_ssh_mode() {
+    local active enabled
+    SSH_SERVICE=sshd; SSH_SOCKET=''; SSH_MIGRATION_NEEDED=0
+    check_openrc_ssh_definition || return 1
+    active=$(ssh_active_state "$SSH_SERVICE") || return 1
+    enabled=$(ssh_enabled_state "$SSH_SERVICE") || return 1
+    SSH_RUNTIME_STATE="$SSH_SERVICE:$active:$enabled::unknown:not-found"
+    [[ $active == active ]] || { warn 'OpenRC sshd 未运行；请先确认服务和新连接可用。'; return 1; }
+    check_sshd_listener_ownership
 }
 ssh_port22_listeners() {
     local listeners
@@ -485,7 +628,7 @@ ssh_port22_listeners() {
 }
 check_sshd_listener_ownership() {
     local pid listeners line found=0
-    pid=$(systemctl show "$SSH_SERVICE" -p MainPID --value) || return 1
+    pid=$(ssh_master_pid) || { warn '无法确认 SSH 主进程身份。'; return 1; }
     [[ $pid =~ ^[1-9][0-9]{0,9}$ ]] || { warn '无法确认 SSH 主进程 PID。'; return 1; }
     listeners=$(ssh_port22_listeners) || return 1
     while IFS= read -r line; do
@@ -515,6 +658,7 @@ check_ssh_stop_policy() {
     [[ -z $(systemctl show "$SSH_SERVICE" -p ExecStartPost --value) ]] || { warn 'SSH 存在自定义 ExecStartPost，拒绝自动启动。'; return 1; }
 }
 check_ssh_reload_mode() {
+    if [[ $SERVICE_MANAGER == openrc ]]; then check_openrc_ssh_mode; return; fi
     local triggers sockets unit property dependencies service_active service_enabled socket_active=unknown socket_enabled=not-found config listen mapping line
     SSH_MIGRATION_NEEDED=0
     SSH_SOCKET=''
@@ -585,6 +729,7 @@ check_ssh_reload_mode() {
     fi
 }
 find_ssh_service() {
+    if [[ $SERVICE_MANAGER == openrc ]]; then check_openrc_ssh_mode; return; fi
     local service start argv environment file token allowed environment_files tokens=()
     command -v systemctl >/dev/null || { warn '无 systemd，SSH 加固仅支持可确认的 systemd reload。'; return 1; }
     SSH_SERVICE=''
@@ -642,7 +787,7 @@ check_ssh_service_health() {
     # ExecReload/start can return before a subsequent daemon failure.
     for _attempt in 1 2 3; do
         sleep 1
-        systemctl is-active --quiet "$SSH_SERVICE" || { warn "$SSH_SERVICE 未保持 active。"; return 1; }
+        ssh_service_active || { warn "$SSH_SERVICE 未保持 active。"; return 1; }
         if (( SSH_MODE_CHANGED )); then
             [[ $(ssh_enabled_state "$SSH_SERVICE") == enabled ]] || { warn 'SSH 服务未永久启用。'; return 1; }
         fi
@@ -658,7 +803,10 @@ check_ssh_service_health() {
 apply_ssh_configuration() {
     # The candidate has already passed -t/-T/-C. Never HUP a socket listener.
     SSH_RELOAD_ATTEMPTED=1
-    if (( SSH_MIGRATION_NEEDED )); then
+    if [[ $SERVICE_MANAGER == openrc ]]; then
+        check_openrc_ssh_mode || return 1
+        ssh_service_step "reload OpenRC $SSH_SERVICE" rc-service "$SSH_SERVICE" reload || return 1
+    elif (( SSH_MIGRATION_NEEDED )); then
         SSH_MODE_CHANGED=1 # Set BEFORE the first potentially partial mutation.
         ssh_service_step "停止 $SSH_SOCKET" systemctl stop "$SSH_SOCKET" || return 1
         ssh_service_step "禁用 $SSH_SOCKET" systemctl disable "$SSH_SOCKET" || return 1
@@ -690,11 +838,34 @@ restore_ssh_enabled_state() {
 prepare_ssh_runtime_dir() {
     # A failed/stopped unit can have removed RuntimeDirectory before rollback -t.
     # This is recovery only: the original -t gate is NEVER bypassed.
+    # Alpine's /var/empty belongs to OpenSSH packages; never synthesize Debian's
+    # RuntimeDirectory or repair a modified package directory here.
+    if [[ $SERVICE_MANAGER == openrc ]]; then [[ -d $SSH_RUNTIME_DIR && ! -L $SSH_RUNTIME_DIR ]]; return; fi
     [[ ! -L $SSH_RUNTIME_DIR ]] || return 1
     [[ -d $SSH_RUNTIME_DIR ]] || install -d -o root -g root -m 0755 "$SSH_RUNTIME_DIR"
 }
 restore_ssh_runtime() {
     local failed=0 listeners _attempt unit state
+    if [[ $SERVICE_MANAGER == openrc ]]; then
+        check_openrc_ssh_definition && "$SSHD" -t -f "$SSHD_CONFIG" || return 1
+        if ssh_service_active; then
+            check_sshd_listener_ownership || return 1
+            rc-service "$SSH_SERVICE" reload || return 1
+        else
+            # zap only forgets OpenRC's stale service state; no stop/restart and
+            # no signal to established sessions. Refuse if any listener remains.
+            listeners=$(ssh_port22_listeners) || return 1
+            [[ -z $listeners ]] || return 1
+            if [[ -f $SSH_PIDFILE ]]; then
+                state=$(cat "$SSH_PIDFILE") || return 1
+                [[ $state =~ ^[1-9][0-9]{0,9}$ ]] || return 1
+                [[ ! -d /proc/$state ]] || return 1
+            fi
+            rc-service "$SSH_SERVICE" zap && rc-service "$SSH_SERVICE" start || return 1
+        fi
+        check_ssh_service_health
+        return
+    fi
     if (( SSH_MODE_CHANGED )); then
         # Revalidate the stop policy rather than risking killing session children.
         check_ssh_stop_policy || return 1
@@ -770,7 +941,9 @@ rollback_ssh() {
             restored '已恢复原 SSH 启动模式和 22 端口监听；请另开终端验证登录。'
         else
             error "配置已恢复，但 SSH 服务/监听恢复验证失败！不要关闭当前会话；请用 Console 或当前 root 会话排查。备份: $SSH_BACKUP"
-            warn '请检查 systemctl status ssh.service ssh.socket、journalctl -u ssh.service 和 ss -lntp。'
+            if [[ $SERVICE_MANAGER == openrc ]]; then
+                warn '请检查 rc-service sshd status、/var/log/messages（如已启用 syslog）和 ss -lntp。'
+            else warn '请检查 systemctl status ssh.service ssh.socket、journalctl -u ssh.service 和 ss -lntp。'; fi
             show_ssh_runtime_status >&2
             return 1
         fi
@@ -895,19 +1068,26 @@ disable_ssh_password_auth() {
 
 get_timezone() {
     local zone
-    zone=$(timedatectl show -p Timezone --value 2>/dev/null || true)
+    zone=''
+    if [[ $SERVICE_MANAGER == systemd ]]; then zone=$(timedatectl show -p Timezone --value 2>/dev/null || true); fi
     if [[ -z $zone && -r /etc/timezone ]]; then zone=$(cat /etc/timezone); fi
+    if [[ -z $zone && -L /etc/localtime ]]; then
+        zone=$(readlink /etc/localtime)
+        case "$zone" in */zoneinfo/*) zone=${zone#*/zoneinfo/} ;; *) zone='' ;; esac
+    fi
     printf '%s\n' "${zone:-unknown}"
 }
 configure_timezone() {
-    if command -v timedatectl >/dev/null && timedatectl set-timezone UTC; then return 0; fi
+    if [[ $SERVICE_MANAGER == systemd ]] && command -v timedatectl >/dev/null && timedatectl set-timezone UTC; then return 0; fi
+    [[ -f /usr/share/zoneinfo/UTC ]] || install_packages tzdata || return 1
     [[ -f /usr/share/zoneinfo/UTC ]] || return 1
-    warn 'timedatectl 不可用，使用 tzdata 文件方式设置 UTC（适用于非 systemd/LXC）。'
+    info '使用时区文件设置 UTC。'
     local backup
     mkdir -p "$BACKUP_ROOT" && chmod 700 "$BACKUP_ROOT" || return 1
     backup=$(mktemp -d "$BACKUP_ROOT/timezone-XXXXXX") || return 1
-    cp -a /etc/localtime "$backup/" || return 1
+    if [[ -e /etc/localtime || -L /etc/localtime ]]; then cp -a /etc/localtime "$backup/" || return 1; fi
     [[ ! -e /etc/timezone ]] || cp -p /etc/timezone "$backup/" || return 1
+    [[ ! -d /etc/localtime && ! -L /etc/timezone ]] || { warn '时区文件布局非标准，未修改。'; return 1; }
     ln -sfn /usr/share/zoneinfo/UTC /etc/localtime || return 1
     printf 'UTC\n' > /etc/timezone || return 1
 }
@@ -918,30 +1098,38 @@ basic_init() {
     ui_field '基础包' "${BASIC_PACKAGES[*]}"
     confirm '继续？ [Y/n] ' y || return 0
     info '1/3 更新软件索引'
-    apt-get update || return 1
+    update_package_index || return 1
     for package in "${BASIC_PACKAGES[@]}"; do
         if ! package_installed "$package"; then missing+=("$package"); fi
     done
     info '2/3 检查基础软件包'
     if (( ${#missing[@]} )); then
         ui_field '待安装' "${missing[*]}"
-        apt-get install -y "${missing[@]}" || return 1
+        add_packages "${missing[@]}" || return 1
     else success '基础软件包已齐全。'
     fi
     info '3/3 设置系统时区为 UTC'
     configure_timezone || return 1
     say ''
-    if confirm '是否执行完整系统升级？ [Y/n] ' y; then
+    if confirm '是否升级当前发行版的软件包？ [Y/n] ' y; then
         warn '升级可能触发发行版包维护脚本，请留意软件包提示。'
         info '正在升级系统软件包；工具不会主动重启。'
-        apt-get full-upgrade -y || return 1
+        if [[ $OS_FAMILY == alpine ]]; then apk upgrade || return 1
+        else apt-get full-upgrade -y || return 1; fi
     fi
     success '基础环境初始化完成。'
-    if [[ -e /var/run/reboot-required ]]; then warn '系统检测到重启标记，请安排手动重启。'; else hint '未检测到系统重启标记。'; fi
+    if [[ $OS_FAMILY == alpine ]]; then
+        hint 'Alpine 没有统一的 reboot-required 标记；若升级了内核或系统库，请安排维护窗口检查是否需要重启。'
+    elif [[ -e /var/run/reboot-required ]]; then warn '系统检测到重启标记，请安排手动重启。'; else hint '未检测到系统重启标记。'; fi
 }
 show_ssh_runtime_status() {
     local unit service='' socket='' service_state=unknown socket_state=unknown enabled=unknown listeners owner=none mode=unknown tone
-    if command -v systemctl >/dev/null; then
+    if [[ $SERVICE_MANAGER == openrc ]]; then
+        service=sshd
+        service_state=$(ssh_active_state "$service") || service_state=unknown
+        socket_state=not-applicable; enabled=not-applicable
+        [[ ! -x $SSH_OPENRC_INIT ]] || mode=service
+    elif command -v systemctl >/dev/null; then
         for unit in ssh.service sshd.service; do
             if [[ $(systemctl show "$unit" -p LoadState --value 2>/dev/null) == loaded ]]; then service=$unit; break; fi
         done
@@ -961,7 +1149,7 @@ show_ssh_runtime_status() {
         if [[ -n $listeners ]]; then
             owner=other
             if [[ $listeners == *'("sshd",'* ]]; then owner=sshd; fi
-            if [[ $listeners == *'pid=1,'* ]]; then
+            if [[ $SERVICE_MANAGER == systemd && $listeners == *'pid=1,'* ]]; then
                 mode='socket-activated'
                 if [[ $owner == sshd ]]; then owner='systemd + sshd'; else owner=systemd; fi
             fi
@@ -970,11 +1158,13 @@ show_ssh_runtime_status() {
     fi
     tone=caution; [[ $mode != service ]] || tone=good
     ui_field 'Mode' "$mode" "$tone"
+    ui_field 'Manager' "$SERVICE_MANAGER"
     tone=caution
     case "$service_state" in active) tone=good ;; failed) tone=bad ;; esac
     ui_field 'Service' "$service_state${service:+ ($service)}" "$tone"
+    if [[ $SERVICE_MANAGER == openrc ]]; then ui_field '开机启动' "$(ssh_enabled_state sshd)"; fi
     tone=caution
-    case "$socket_state:$enabled" in inactive:disabled|inactive:masked|inactive:masked-runtime|not-found:not-found) tone=muted ;; esac
+    case "$socket_state:$enabled" in inactive:disabled|inactive:masked|inactive:masked-runtime|not-found:not-found|not-applicable:not-applicable) tone=muted ;; esac
     ui_field 'Socket' "$socket_state${socket:+ ($socket)}, enabled: $enabled" "$tone"
     tone=caution
     case "$owner" in sshd) tone=good ;; none) tone=bad ;; esac
@@ -984,13 +1174,13 @@ show_status() {
     local user config package admin=no key=no safe=no count sudo_state
     ui_section '系统信息'
     ui_field '系统' "$OS_NAME"; ui_field '内核' "$(uname -r)"
-    ui_field '架构' "$(dpkg --print-architecture)"; ui_field '时区' "$(get_timezone)"
+    ui_field '架构' "$(uname -m)"; ui_field '时区' "$(get_timezone)"
     ui_section '用户与 SSH Key'
-    hint '普通登录用户按 login.defs UID 范围和登录 shell 筛选。'
+    hint "普通登录用户按 UID ${UID_MIN}–${UID_MAX} 和登录 shell 筛选。"
     ui_field 'root' "sudo 不适用 / $(count_authorized_keys root) 个有效公钥"
     while IFS= read -r user; do
-        sudo_state='未加入'
-        if user_has_sudo "$user"; then admin=yes; sudo_state='已加入'; fi
+        sudo_state='未配置'
+        if user_has_sudo "$user"; then admin=yes; sudo_state='已配置'; fi
         count=$(count_authorized_keys "$user")
         ui_field "$user" "sudo ${sudo_state} / $count 个有效公钥"
         if (( count > 0 )); then key=yes; fi
@@ -1056,7 +1246,7 @@ show_menu() {
 main() {
     local choice
     setup_ui
-    [[ -t 0 && -t 1 ]] || { error '需要交互终端；请使用 bash <(curl -fsSL https://install.dry.li/init)。'; return 1; }
+    [[ -t 0 && -t 1 ]] || { error '需要交互终端；请下载脚本后使用 bash 执行，或在 Bash 中使用进程替换入口。'; return 1; }
     require_root || return 1
     detect_os || return 1
     umask 077
@@ -1064,7 +1254,7 @@ main() {
     trap cleanup EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM HUP
-    command -v flock >/dev/null || { warn '缺少 flock（util-linux）。'; return 1; }
+    command -v flock >/dev/null || { warn '缺少 flock；Debian/Ubuntu 安装 util-linux，Alpine 安装 flock。'; return 1; }
     exec 9>/run/linux-init.lock
     flock -n 9 || { warn '另一个 Linux Init 正在运行，请稍后再试。'; return 1; }
     while true; do

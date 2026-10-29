@@ -8,18 +8,27 @@
 
 | 项目 | 用途 | 版本 | 文档 |
 | --- | --- | --- | --- |
-| [Linux Init](./public/linux-init/linux-init.sh) | Debian / Ubuntu 交互式初始化管理菜单 | 1.2.0 | [使用说明](./docs/linux-init.md) |
-| [Snell Alpine](./public/snell-alpine/snell-alpine-lowspace.sh) | Alpine Linux 下安装与管理 Snell + ShadowTLS | 1.3.2 | [使用说明](./docs/snell-alpine.md) |
+| [Linux Init](./public/linux-init/linux-init.sh) | Debian / Ubuntu / Alpine 交互式初始化管理菜单 | 1.3.0 | [使用说明](./docs/linux-init.md) |
+| [Snell Alpine](./public/snell-alpine/snell-alpine-lowspace.sh) | Alpine Linux 下安装与管理 Snell + ShadowTLS | 1.3.3 | [使用说明](./docs/snell-alpine.md) |
 
 ### Linux Init
 
 支持创建用户、配置 sudo、管理 SSH 公钥、关闭 SSH 密码登录、初始化基础环境和查看系统状态。各项功能可独立执行，菜单可重复打开。
 
-适用于 Debian 12/13、Ubuntu 22.04/24.04/26.04，支持 amd64 和 arm64。需要交互终端；普通用户运行时通过 sudo 提权。
+适用于 Debian 12/13、Ubuntu 22.04/24.04/26.04、Alpine 3.x，支持 amd64 和 arm64。需要交互终端和 Bash；普通用户运行时通过已配置的 sudo 提权。
 
 ```bash
-bash <(curl -fsSL https://install.dry.li/init)
+bash <(curl -fsSL https://dry.li/init)
 ```
+
+Alpine 默认使用 ash。首次以 root 安装入口依赖，再由 Bash 解析启动命令：
+
+```sh
+apk add --no-cache bash curl ca-certificates
+bash -c 'bash <(curl -fsSL https://dry.li/init)'
+```
+
+Alpine 使用 `adduser` / `addgroup` 和真实 sudo，授权仅针对选中的用户；SSH 加固适用于已运行的标准 OpenRC/OpenSSH 服务，不自动替换 Dropbear。基础初始化会补齐 SSH 检查和终端显示所需的包。
 
 关闭 SSH 密码登录前，请先在新终端确认普通用户的公钥登录和 sudo 可用，并保留原 SSH 会话。配置、恢复和兼容性边界见 [使用说明](./docs/linux-init.md)。
 
@@ -30,13 +39,13 @@ bash <(curl -fsSL https://install.dry.li/init)
 在 Alpine 服务器上以 root 运行：
 
 ```sh
-sh -c "$(curl -fsSL https://install.dry.li/snell-alpine)"
+sh -c "$(curl -fsSL https://dry.li/snell-alpine)"
 ```
 
 已配置 sudo 的普通用户：
 
 ```sh
-sudo sh -c "$(curl -fsSL https://install.dry.li/snell-alpine)"
+sudo sh -c "$(curl -fsSL https://dry.li/snell-alpine)"
 ```
 
 如缺少 curl，可先以 root 安装：
