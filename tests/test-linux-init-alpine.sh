@@ -36,6 +36,15 @@ addgroup other_wheel wheel
 if sudo_policy_ready other_wheel; then die 'grant leaked to other wheel member'; fi
 ok 'real BusyBox user creation, password, wheel, scoped sudo and repeated action'
 
+# Reproduce a pre-existing key-only login account with a locked local password,
+# then repair it through the menu without recreating the user or changing sudo.
+command passwd -l init_test
+if account_password_ready init_test; then die 'locked local password reported ready'; fi
+create_user <<< $'init_test\n2'
+account_password_ready init_test || die 'menu did not repair existing password'
+cmp "$WORK_DIR/sudo-before" /etc/sudoers.d/linux-init-init_test || die 'password action changed sudo policy'
+ok 'existing account local password setup through menu, sudo policy preserved'
+
 ssh-keygen -q -t ed25519 -N '' -f "$WORK_DIR/client"
 key=$(cat "$WORK_DIR/client.pub")
 append_keys init_test "$key"

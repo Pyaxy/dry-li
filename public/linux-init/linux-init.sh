@@ -6,7 +6,7 @@ set -Eeuo pipefail
 DEFAULT_SSH_PUBLIC_KEYS=(
     # "ssh-ed25519 AAAA... user@example"
 )
-VERSION="1.3.0"
+VERSION="1.3.1"
 BASIC_PACKAGES=(sudo curl ca-certificates git vim htop unzip)
 OS_FAMILY=debian
 ADMIN_GROUP=sudo
@@ -276,6 +276,30 @@ account_password_ready() {
         [[ $max =~ ^[0-9]+$ ]] && (( last + max > today )) || return 1
     fi
 }
+password_label() {
+    if account_password_ready "$1"; then printf '已就绪'; else printf '未就绪（未设置、锁定或到期）'; fi
+}
+set_user_password() {
+    local user=$1
+    user_exists "$user" || { warn '用户不存在，请先创建用户。'; return 1; }
+    if [[ $user != root ]] && ! list_login_users | grep -Fx -- "$user" >/dev/null; then
+        warn '不修改系统或不可登录用户的密码。'; return 1
+    fi
+    ui_section '设置 / 修改 Linux 密码'
+    ui_field '用户' "$user"
+    hint '这是 sudo / Console 使用的本地密码；SSH 密码登录仍由 SSH 配置控制。'
+    if [[ $user == root ]]; then hint 'SSH 加固需要普通 sudo 管理员可登录，不要求 root 设置本地密码。'; fi
+    info '请按系统提示输入两次新密码，输入时不会显示字符：'
+    # Let the platform passwd command read the password directly from the TTY.
+    # Never capture it in a variable, command argument, log or temporary file.
+    if ! passwd "$user"; then
+        warn "密码设置失败或已取消；请在用户管理中重试，或用 passwd $user 检查。"; return 1
+    fi
+    if ! account_password_ready "$user"; then
+        warn '密码命令已完成，但账号/密码状态仍未就绪，可能仍被锁定或到期；请人工检查。'; return 1
+    fi
+    success "$user 的 Linux 本地密码已设置且可用。"
+}
 admin_ready() {
     local user=$1 home line
     user_has_sudo "$user" && account_password_ready "$user" || return 1
@@ -367,25 +391,43 @@ show_user() {
     ui_field '用户' "$user"
     ui_field 'Home' "$(user_home "$user")"
     ui_field 'Shell' "$(getent passwd "$user" | cut -d: -f7)"
-    if user_has_sudo "$user"; then ui_field 'sudo' '已配置' good; else ui_field 'sudo' '未配置' caution; fi
+    if [[ $user == root ]]; then ui_field 'sudo' '不适用（root）'
+    elif user_has_sudo "$user"; then ui_field 'sudo' '已配置' good; else ui_field 'sudo' '未配置' caution; fi
+    ui_field '本地密码' "$(password_label "$user")"
     ui_field '用户组' "$(id -nG "$user")"
     ui_field '有效 SSH Key' "$(count_authorized_keys "$user")"
 }
 create_user() {
     local user choice
-    ui_section '创建用户 / sudo 权限'
+    ui_section '用户管理 / 密码 / sudo'
     ask '请输入用户名 [ppy]: ' user || return 0
     user=${user:-ppy}
     [[ $user =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { warn '用户名须以小写字母/下划线开头，最多 32 位，只含小写字母、数字、_、-。'; return 0; }
     if user_exists "$user"; then
         info "用户 $user 已存在。"
         show_user "$user"
-        if ! list_login_users | grep -Fx -- "$user" >/dev/null; then
-            warn '这是 root 或系统/不可登录用户，不提供 sudo 管理。'; return 0
+        if [[ $user == root ]]; then
+            hint 'root 可设置本地密码用于 Console；SSH 加固仍需要普通 sudo 管理员。'
+            say ''; ui_option 1 '设置 / 修改 Linux 密码'; ui_option 0 '返回主页'
+            ask '请选择: ' choice || return 0
+            case "$choice" in
+                1) set_user_password "$user" || return 1 ;;
+                0) ;;
+                *) warn '请输入菜单中的编号。' ;;
+            esac
+            return 0
         fi
-        say ''; ui_option 1 '授予 sudo 权限'; ui_option 2 '保持不变'; ui_option 0 '返回主页'
+        if ! list_login_users | grep -Fx -- "$user" >/dev/null; then
+            warn '这是系统/不可登录用户，不提供密码或 sudo 管理。'; return 0
+        fi
+        say ''; ui_option 1 '授予 sudo 权限'; ui_option 2 '设置 / 修改 Linux 密码'; ui_option 0 '返回主页'
         ask '请选择: ' choice || return 0
-        [[ $choice != 1 ]] || grant_sudo "$user"
+        case "$choice" in
+            1) grant_sudo "$user" || return 1 ;;
+            2) set_user_password "$user" || return 1 ;;
+            0) ;;
+            *) warn '请输入菜单中的编号。' ;;
+        esac
         return 0
     fi
     [[ ! -e /home/$user && ! -L /home/$user ]] || { warn '同名 home 路径已存在，拒绝使用。'; return 0; }
@@ -395,10 +437,9 @@ create_user() {
         install_packages sudo || return 1
         useradd -m -d "/home/$user" -s /bin/bash "$user" || return 1
     fi
-    info '请设置 Linux 密码，用于 sudo / Console：'
-    if ! passwd "$user"; then
-        warn "密码未设置成功；用户已保留，请用 passwd $user 重试。SSH 加固会拒绝这个账号。"
-        show_user "$user"; return 0
+    if ! set_user_password "$user"; then
+        warn "用户已保留；请在菜单 1 输入 $user，选择设置 / 修改 Linux 密码后重试。"
+        show_user "$user"; return 1
     fi
     if confirm '是否授予该用户 sudo 权限？ [Y/n] ' y; then grant_sudo "$user" || return 1; fi
     success "用户 $user 创建完成。"
@@ -999,7 +1040,8 @@ disable_ssh_password_auth() {
     if ! check_ssh_hardening_readiness; then
         warn '当前不满足关闭 SSH 密码登录的条件。'
         warn '没有非 root 管理员同时满足：sudo、未过期的本地密码、安全权限、公钥。'
-        say '请先创建用户、设置 Linux 密码、授予 sudo 并授权 SSH Key。'; return 0
+        say '请在菜单 1 创建普通用户，或为已有用户设置 Linux 本地密码和 sudo，再授权 SSH Key。'
+        hint '需要的是普通管理员用于 sudo 的本地密码，不要求给 root 设置密码。'; return 0
     fi
     check_supported_ssh_layout && find_ssh_service || return 0
     planned_state=$SSH_RUNTIME_STATE
@@ -1177,12 +1219,12 @@ show_status() {
     ui_field '架构' "$(uname -m)"; ui_field '时区' "$(get_timezone)"
     ui_section '用户与 SSH Key'
     hint "普通登录用户按 UID ${UID_MIN}–${UID_MAX} 和登录 shell 筛选。"
-    ui_field 'root' "sudo 不适用 / $(count_authorized_keys root) 个有效公钥"
+    ui_field 'root' "sudo 不适用 / 本地密码 $(password_label root) / $(count_authorized_keys root) 个有效公钥"
     while IFS= read -r user; do
         sudo_state='未配置'
         if user_has_sudo "$user"; then admin=yes; sudo_state='已配置'; fi
         count=$(count_authorized_keys "$user")
-        ui_field "$user" "sudo ${sudo_state} / $count 个有效公钥"
+        ui_field "$user" "sudo ${sudo_state} / 本地密码 $(password_label "$user") / $count 个有效公钥"
         if (( count > 0 )); then key=yes; fi
     done < <(list_login_users)
     ui_section 'SSH 工作模式与登录策略'
@@ -1229,7 +1271,7 @@ show_menu() {
     ui_field '当前用户' "$(id -un) / 时区 $(get_timezone)"
     ui_field 'SSH 密码登录' "$password"; ui_field 'root SSH 登录' "$rootlogin"
     say ''; ui_text "$BOLD$COLOR" '用户与 SSH'
-    ui_option 1 '创建用户 / 补 sudo 权限'
+    ui_option 1 '用户管理 / 密码 / sudo'
     ui_option 2 'SSH Key 授权'
     if (( UI_HEIGHT >= 30 )); then hint "    $key_hint"; fi
     ui_option 3 '关闭 SSH 密码登录'

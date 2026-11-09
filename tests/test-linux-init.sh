@@ -194,7 +194,11 @@ real_sshd=$SSHD
 sshd_test() {
     if [[ $1 == -t && ! -d $SSH_RUNTIME_DIR ]]; then printf 'Missing privilege separation directory: /run/sshd\n' >&2; return 1; fi
     if [[ $1 == -t && -f $SSH_DROPIN ]] && grep -q 'PasswordAuthentication no' "$SSH_DROPIN" && (( SYNTAX_FAIL )); then return 1; fi
-    "$real_sshd" "$@"
+    # Newer Apple OpenSSH prints -T option names in mixed case. Fixtures model
+    # Linux OpenSSH's lowercase keys, just as stat() models its Linux interface.
+    if [[ $1 == -T && $(uname -s) == Darwin ]]; then
+        "$real_sshd" "$@" | awk '{$1=tolower($1); print}'
+    else "$real_sshd" "$@"; fi
 }
 SSHD=sshd_test
 
@@ -276,7 +280,7 @@ ok 'root-only machine: key authorization and hardening safely return'
 
 # Existing-user branch does not recreate users; supplemental sudo is available.
 : > "$LOG"
-create_user <<< $'ppy\n2' >/dev/null
+create_user <<< $'ppy\n0' >/dev/null
 [[ ! -s $LOG ]] || fail 'existing user changed'
 (
     SUDO_MEMBER=no
@@ -286,6 +290,65 @@ create_user <<< $'ppy\n2' >/dev/null
 )
 SUDO_MEMBER=yes
 ok 'existing user and supplemental sudo'
+
+for password_platform in debian alpine; do
+    (
+        OS_FAMILY=$password_platform
+        # A DD/cloud-image administrator may have a key but no local password.
+        printf 'ppy:!:20000:0:99999:7:::\nroot:!:20000:0:99999:7:::\n' > "$SHADOW_FIXTURE"
+        passwd_result='set'
+        passwd() {
+            printf 'passwd %s\n' "$*" >> "$LOG"
+            case "$passwd_result" in
+                fail) return 1 ;;
+                unchanged) return 0 ;;
+            esac
+            awk -F: -v OFS=: -v user="$1" '$1==user {$2="$6$fixture"; $3=20000} {print}' "$SHADOW_FIXTURE" > "$TEST_ROOT/shadow-new"
+            mv "$TEST_ROOT/shadow-new" "$SHADOW_FIXTURE"
+        }
+        : > "$LOG"
+        create_user <<< $'ppy\n0' >/dev/null
+        [[ ! -s $LOG ]] || fail 'return action changed key-only user'
+        if check_ssh_hardening_readiness; then fail 'key-only user without local password passed hardening'; fi
+        create_user <<< $'ppy\n2' > "$TEST_ROOT/password-output"
+        assert_eq "$(cat "$LOG")" 'passwd ppy' 'password action touched unrelated state'
+        account_password_ready ppy || fail 'existing key-only user password not ready'
+        check_ssh_hardening_readiness || fail 'key-only administrator not ready after password setup'
+        grep -q '已设置且可用' "$TEST_ROOT/password-output" || fail 'password success not reported'
+        : > "$LOG"
+        create_user <<< $'ppy\n2' >/dev/null
+        assert_eq "$(cat "$LOG")" 'passwd ppy' 'existing password could not be changed'
+        show_user ppy > "$TEST_ROOT/password-status"
+        grep -q '本地密码: 已就绪' "$TEST_ROOT/password-status" || fail 'password status not shown'
+        ok "$password_platform: set/change existing user's local password, return safely, then pass SSH prerequisites"
+
+        passwd_result=fail
+        if create_user <<< $'ppy\n2' > "$TEST_ROOT/password-output" 2>&1; then fail 'failed passwd reported success'; fi
+        if grep -q '已设置且可用' "$TEST_ROOT/password-output"; then fail 'failed password action printed success'; fi
+        passwd_result=unchanged
+        printf 'ppy:!:20000:0:99999:7:::\nroot:!:20000:0:99999:7:::\n' > "$SHADOW_FIXTURE"
+        if create_user <<< $'ppy\n2' > "$TEST_ROOT/password-output" 2>&1; then fail 'locked account reported password ready'; fi
+        if check_ssh_hardening_readiness; then fail 'locked user passed after unsuccessful password repair'; fi
+        ok "$password_platform: failed or incomplete password setup remains an explicit failure"
+
+        passwd_result='set'
+        : > "$LOG"
+        create_user <<< $'root\n0' >/dev/null
+        [[ ! -s $LOG ]] || fail 'cancelled root password action changed state'
+        create_user <<< $'root\n1' >/dev/null
+        assert_eq "$(cat "$LOG")" 'passwd root' 'root password action changed groups or services'
+        account_password_ready root || fail 'root console password was not set'
+        if check_ssh_hardening_readiness; then fail 'root password incorrectly substituted for ordinary administrator'; fi
+        : > "$LOG"
+        create_user <<< $'daemon\n2' >/dev/null 2>&1
+        [[ ! -s $LOG ]] || fail 'system user password changed'
+        if set_user_password service >/dev/null 2>&1; then fail 'non-login user password changed'; fi
+        if set_user_password absent >/dev/null 2>&1; then fail 'missing user password action succeeded'; fi
+        [[ ! -s $LOG ]] || fail 'guarded password action invoked passwd'
+        ok "$password_platform: root console password is independent, system/missing accounts are protected"
+    )
+done
+set_users
 
 reset_config
 printf 'SSHD_OPTS=\n' > "${SSH_ENV_FILES[0]}"

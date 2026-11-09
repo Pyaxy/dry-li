@@ -1,4 +1,4 @@
-# Linux Init Tool 1.3.0
+# Linux Init Tool 1.3.1
 
 可反复打开的 Debian / Ubuntu / Alpine 初始化管理菜单。启动只检查状态；每项操作独立，选择并确认后才修改系统。
 支持清屏的终端在首次显示和每次返回主页时将标题放到顶部；只清理当前屏幕，保留滚动历史。操作结果保留到按 Enter 返回。
@@ -68,7 +68,7 @@ DEFAULT_SSH_PUBLIC_KEYS=(
 
 | 菜单 | 行为 | 前置条件 |
 | --- | --- | --- |
-| 1 创建用户 / 补 sudo | 默认用户名 `ppy`；新建 `/home/<user>`、`/bin/bash`，调用 `passwd`；默认授予 sudo | root 权限、有效用户名；同名 home 不能预先存在 |
+| 1 用户管理 / 密码 / sudo | 默认用户名 `ppy`；新用户创建 home、Bash 并设置密码；已有普通用户可补 sudo 或设置/修改本地密码；root 只提供本地密码管理 | root 权限、有效用户名；新用户的同名 home 不能预先存在 |
 | 2 SSH Key 授权 | 选择普通登录用户；可选显示 root；预置所有 key 或手动粘贴 | 至少一个普通登录用户、`ssh-keygen`、真实 home、非链接 key 路径 |
 | 3 关闭 SSH 密码登录 | 开启公钥、禁止 SSH 密码/键盘交互和 root SSH；标准 systemd socket 模式迁移为服务模式，Alpine 使用 OpenRC reload | 至少一个满足全部条件的非 root 管理员，标准 OpenSSH 配置和 systemd/OpenRC 服务，22 端口监听；`ss` 可核对进程；确认默认 No |
 | 4 基础环境初始化 | 更新软件索引、安装缺少的基础包、设 UTC，之后可选当前发行版软件包升级 | apt/apk 可用；开始默认 Yes，升级默认 Yes，均可拒绝 |
@@ -79,14 +79,17 @@ DEFAULT_SSH_PUBLIC_KEYS=(
 用户列表描述“正常登录账号类型”，不意味着每个账号都未锁定；加固会进一步检查 shadow 锁定、密码过期和账号到期状态。
 非标准 UID 的管理员暂不自动列入；请先人工核对，不会把系统账号自动当作管理员。
 
-已存在用户会显示 home、shell、sudo、key 数量，不重复创建；普通用户可以在此补 sudo。
+已存在用户会显示 home、shell、sudo、本地密码就绪状态和 key 数量，不重复创建；普通用户可以在此补 sudo，或选择“设置 / 修改 Linux 密码”。选择 0 返回，不改变该用户。
+默认只启用 Key 登录、没有设置密码的系统，可在菜单 1 输入已有普通管理员用户名，再选择 2 设置本地密码。
+密码由系统 `passwd` 交互读取，输入时不显示；脚本不接收、保存或记录明文密码。命令失败或账号状态仍未就绪时明确提示，不报告成功，也不自动授予 sudo。
+设置本地密码用于 sudo / Console，不会更改 SSH 的密码认证策略。SSH 加固要求普通管理员的本地密码可用，**不要求 root 有密码**；需要 root Console 密码时，可在菜单 1 输入 root 后选择 1 设置。
 Debian/Ubuntu 的 `sudo` 一栏表示 sudo 组成员；加固还会验证 `visudo -c` 和实际 `sudo -l -U` 中的常规完整管理员权限。
 Alpine 使用 BusyBox `adduser -D` 创建用户、`passwd` 设置密码、`addgroup <user> wheel` 添加组。
 Alpine 的 wheel 组本身不代表 sudo 已授权：工具安装真实 sudo，写入 `/etc/sudoers.d/linux-init-<user>`，仅向该用户授予 `ALL=(ALL:ALL) ALL`，权限 0440。
 写入前后校验 sudo 配置及实际授权；失败恢复原授权文件，不覆盖非托管的同名文件，不启用整个 wheel 组。
 状态页在 Alpine 上显示实际 sudo 策略检查结果。检测到 `doas-sudo-shim` 时要求人工处理冲突，不自动移除 doas 或改写 doas 策略。
 不会写 NOPASSWD。新加入的组在该用户重新登录后生效。
-若创建用户时 `passwd` 失败，保留已创建账号，并提示用 `passwd <user>` 重试；不会删除账号。
+若创建用户时密码设置失败，保留已创建账号，并提示回到菜单 1 设置密码；不会删除账号。修改密码后仍被锁定或账号到期时需人工处理，不自动解除其他账号限制。
 
 公钥授权创建 `.ssh` 700 / `authorized_keys` 600，设置用户 uid/gid，保留已有 key。
 预置整个批次先经 `ssh-keygen` 验证再写入；相同“类型 + 公钥数据”即使注释不同也不重复追加。
@@ -250,7 +253,7 @@ sh build-pages.sh
 
 隔离测试只 source 函数，使用临时用户/配置数据和模拟管理命令。
 公钥校验及 `sshd -t/-T/-C` 使用真实 OpenSSH，仅读取临时配置/host key，不启动 daemon，不修改宿主机 SSH。
-覆盖 root-only、用户筛选、已有用户补 sudo、key 去重/损坏数据/权限/链接、锁定/到期/sudo 策略、Include/cloud-init 冲突、Match/服务参数拒绝、公钥算法拒绝、socket/service 迁移（同时活动、仅 socket 活动、仅启用、runtime 启用、sshd 别名）、逐步骤失败及原模式回滚、不安全停止策略/端口/地址拒绝、状态页、确认期间启动方式变化、首次及候选语法失败、reload 失败/延迟退出/恢复失败去重、TERM 回滚、process-substitution 重建，以及基础安装/升级确认。
+覆盖 root-only、用户筛选、已有用户补 sudo、已有用户设置/修改密码、密码失败/状态未就绪、root Console 密码独立性、key 去重/损坏数据/权限/链接、锁定/到期/sudo 策略、Include/cloud-init 冲突、Match/服务参数拒绝、公钥算法拒绝、socket/service 迁移（同时活动、仅 socket 活动、仅启用、runtime 启用、sshd 别名）、逐步骤失败及原模式回滚、不安全停止策略/端口/地址拒绝、状态页、确认期间启动方式变化、首次及候选语法失败、reload 失败/延迟退出/恢复失败去重、TERM 回滚、process-substitution 重建，以及基础安装/升级确认。
 测试脚本和 README 位于 `public/` 外，不进入 `dist/`。
 
 OpenRC 隔离用例另覆盖自定义脚本/参数/runlevel 配置/PID 拒绝、候选语法失败、reload 失败、主进程退出后的恢复、终止回滚去重和 apk 分支。
@@ -283,6 +286,6 @@ docker run --rm -v "$PWD:/workspace:ro" -e LINUX_INIT_CONTAINER_TEST=1 alpine:3.
 ## 典型流程
 
 - 全新机器只有 root：创建用户 → SSH Key 授权 → **新终端验证公钥登录和 sudo** → 关闭 SSH 密码登录 → 基础初始化。
-- 已有普通用户：如有必要在菜单 1 补 sudo/用 `passwd <user>` 修复本地密码 → 直接授权 → 新终端验证 → 关闭密码。
+- 已有普通用户：如有必要在菜单 1 补 sudo/设置本地密码 → 直接授权 → 新终端验证公钥登录及 sudo → 关闭 SSH 密码登录。
 - 已初始化：重新运行，查看状态或新增用户/key；满足目标的 SSH 配置不重复修改。
 - 任意顺序：可先执行基础初始化；未满足用户条件的授权/加固只说明原因并返回菜单，不强制串行跑全部步骤。

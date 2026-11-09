@@ -8,12 +8,12 @@
 
 | 项目 | 用途 | 版本 | 文档 |
 | --- | --- | --- | --- |
-| [Linux Init](./public/linux-init/linux-init.sh) | Debian / Ubuntu / Alpine 交互式初始化管理菜单 | 1.3.0 | [使用说明](./docs/linux-init.md) |
+| [Linux Init](./public/linux-init/linux-init.sh) | Debian / Ubuntu / Alpine 交互式初始化管理菜单 | 1.3.1 | [使用说明](./docs/linux-init.md) |
 | [Snell Alpine](./public/snell-alpine/snell-alpine-lowspace.sh) | Alpine Linux 下安装与管理 Snell + ShadowTLS | 1.3.3 | [使用说明](./docs/snell-alpine.md) |
 
 ### Linux Init
 
-支持创建用户、配置 sudo、管理 SSH 公钥、关闭 SSH 密码登录、初始化基础环境和查看系统状态。各项功能可独立执行，菜单可重复打开。
+支持创建用户、设置或修改 Linux 本地密码、配置 sudo、管理 SSH 公钥、关闭 SSH 密码登录、初始化基础环境和查看系统状态。各项功能可独立执行，菜单可重复打开。
 
 适用于 Debian 12/13、Ubuntu 22.04/24.04/26.04、Alpine 3.x，支持 amd64 和 arm64。需要交互终端和 Bash；普通用户运行时通过已配置的 sudo 提权。
 
